@@ -46,6 +46,19 @@ pub fn init(conn: &Connection) -> Result<(), HistoryError> {
          END",
         [],
     )?;
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, query_text) VALUES('delete', old.rowid, old.query_text);
+         END",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, query_text) VALUES('delete', old.rowid, old.query_text);
+            INSERT INTO history_fts(rowid, query_text) VALUES (new.rowid, new.query_text);
+         END",
+        [],
+    )?;
     Ok(())
 }
 

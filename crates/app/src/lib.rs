@@ -98,6 +98,8 @@ pub enum AppEvent {
 pub struct AppState {
     pub connections: HashMap<ConnectionId, ConnectionState>,
     pub queries: HashMap<QueryId, String>,
+    /// Derived from `connections` (`ConnectionState::tx()` is canonical); kept for
+    /// fast `disconnect_requires_decision` check and updated via `set_tx` / poll_events.
     pub tx: HashMap<ConnectionId, TxState>,
     pub schema: RwLock<Option<Arc<SchemaModel>>>,
 }
@@ -156,12 +158,11 @@ impl AppController {
     }
 
     pub fn send_command(&self, cmd: AppCommand) {
-        // §30: never block UI thread; drop oldest if full (bounded 256)
-        if let Err(crossbeam_channel::TrySendError::Full(cmd)) = self.cmd_tx.try_send(cmd) {
+        // §30: never block UI thread; bounded 256.
+        // NOTE: after PgnativeApp::new swaps cmd_rx with a dummy receiver,
+        // self.cmd_rx is not paired with cmd_tx — do not try to drain it.
+        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.cmd_tx.try_send(cmd) {
             tracing::warn!("cmd channel full — dropping command");
-            // Make room: drop one pending and retry once
-            let _ = self.cmd_rx.try_recv();
-            let _ = self.cmd_tx.try_send(cmd);
         }
     }
 
@@ -239,53 +240,79 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         .unwrap_or(0);
 
     if version < 1 {
-        // v1: baseline tables from storage crates
-        pgnative_storage_connections::init(conn).map_err(|e| match e {
-            pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_history::init(conn).map_err(|e| match e {
-            pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_editor_state::init(conn).map_err(|e| match e {
-            pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_preferences::init(conn).map_err(|e| match e {
-            pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
-            pgnative_storage_preferences::PrefError::Json(_) => {
-                rusqlite::Error::InvalidParameterName("json".into())
+        conn.execute("BEGIN", [])?;
+        let res: Result<(), rusqlite::Error> = (|| {
+            // v1: baseline tables from storage crates
+            pgnative_storage_connections::init(conn).map_err(|e| match e {
+                pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_history::init(conn).map_err(|e| match e {
+                pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_editor_state::init(conn).map_err(|e| match e {
+                pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_preferences::init(conn).map_err(|e| match e {
+                pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
+                pgnative_storage_preferences::PrefError::Json(_) => {
+                    rusqlite::Error::InvalidParameterName("json".into())
+                }
+            })?;
+            conn.execute("PRAGMA user_version=1", [])?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
             }
-        })?;
-        conn.execute("PRAGMA user_version=1", [])?;
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        }
     }
     if version < 2 {
-        // v2: add updated_at column to connections if missing (backwards-aware)
-        // and create index on history.connection_id
-        let has_updated: bool = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='connections'")
-            .ok()
-            .and_then(|mut s| {
-                s.query_row([], |r| r.get::<_, Option<String>>(0))
-                    .ok()
-                    .flatten()
-            })
-            .map(|sql| sql.contains("updated_at"))
-            .unwrap_or(false);
-        if !has_updated {
-            // ALTER TABLE is idempotent via try; ignore if column exists
+        conn.execute("BEGIN", [])?;
+        let res: Result<(), rusqlite::Error> = (|| {
+            // v2: add updated_at column to connections if missing (backwards-aware)
+            // and create index on history.connection_id
+            let has_updated: bool = conn
+                .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='connections'")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_row([], |r| r.get::<_, Option<String>>(0))
+                        .ok()
+                        .flatten()
+                })
+                .map(|sql| sql.contains("updated_at"))
+                .unwrap_or(false);
+            if !has_updated {
+                // ALTER TABLE is idempotent via try; ignore if column exists
+                let _ = conn.execute(
+                    "ALTER TABLE connections ADD COLUMN updated_at INTEGER DEFAULT NULL",
+                    [],
+                );
+            }
             let _ = conn.execute(
-                "ALTER TABLE connections ADD COLUMN updated_at INTEGER DEFAULT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_history_connection ON history(connection_id)",
                 [],
             );
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC)",
+                [],
+            );
+            conn.execute("PRAGMA user_version=2", [])?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
         }
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_connection ON history(connection_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC)",
-            [],
-        );
-        conn.execute("PRAGMA user_version=2", [])?;
     }
     Ok(())
 }
