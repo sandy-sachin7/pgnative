@@ -38,8 +38,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/anomalyco/pgnative"
-authors = ["pgNative contributors"]
+repository = "https://github.com/sandy-sachin7/pgnative"
+authors = ["Sandy Sachin"]
 
 [workspace.dependencies]
 # --- UI ---
@@ -79,8 +79,9 @@ bytes = "1.12.1"
 arcstr = "1.2.0"
 
 # --- Concurrency ---
-crossbeam-channel = "0.5.15"
+crossbeam-channel = "0.5.16"
 parking_lot = "0.12.5"
+arc-swap = "1.7.1"
 async-trait = "0.1.88"
 
 # --- Errors / logging ---

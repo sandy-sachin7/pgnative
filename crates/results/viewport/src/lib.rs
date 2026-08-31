@@ -1,5 +1,7 @@
 //! Viewport snapshot for virtualized rendering — egui-independent.
 //! Implements AGENTS.md §18 per plan C7.
+//! Eframe integration: UI owns ViewportState, store is SharedStore mutated
+//! only by Tokio, rendering pulls `snapshot_range` (no per-frame alloc).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use pgnative_results_store::{ResultStore, StoreState};
 use pgnative_results_value::Row;
 
 /// UI-owned viewport state (§18) — cheap, no locks.
+/// Designed for `eframe::egui::ScrollArea::show_rows` virtualization.
 #[derive(Debug, Clone)]
 pub struct ViewportState {
     pub offset: usize,
@@ -29,6 +32,8 @@ impl Default for ViewportState {
 
 impl ViewportState {
     /// Compute visible row range from scroll.
+    /// `scroll_y` = current scroll offset, `viewport_h` = visible height.
+    /// Includes overscan rows above and below for smooth scrolling.
     #[must_use]
     pub fn visible_range(&self, scroll_y: f32, viewport_h: f32) -> Range<usize> {
         let first = (scroll_y / self.row_height).floor() as usize;
@@ -38,16 +43,51 @@ impl ViewportState {
         start..end
     }
 
+    /// Total virtual height for `ScrollArea` (used by eframe).
+    #[must_use]
+    pub fn total_height(&self, total_rows: usize) -> f32 {
+        total_rows as f32 * self.row_height
+    }
+
+    /// Clamp offset to valid range given current store length.
+    #[must_use]
+    pub fn clamped_offset(&self, total_rows: usize) -> usize {
+        if total_rows == 0 || self.len >= total_rows {
+            0
+        } else {
+            self.offset.min(total_rows - self.len)
+        }
+    }
+
+    /// Update offset from scroll position (eframe scroll → offset).
+    pub fn set_offset_from_scroll(&mut self, scroll_y: f32) {
+        self.offset = (scroll_y / self.row_height).floor() as usize;
+    }
+
     /// Snapshot rows for rendering — copies only `Arc` + index math, no per-cell alloc.
+    /// Backpressure: store is `Arc<RwLock<ResultStore>>` in app; this takes `&ResultStore`
+    /// under read lock for one call, then releases (no lock held during render).
     #[must_use]
     pub fn snapshot(&self, store: &ResultStore) -> ViewportSnapshot {
         let total = store.len();
-        let rows = store.snapshot_range(self.offset, self.len);
+        let clamped = self.clamped_offset(total);
+        let rows = store.snapshot_range(clamped, self.len);
         ViewportSnapshot {
             rows,
             total,
             state: store.state(),
+            offset: clamped,
         }
+    }
+
+    /// Eframe helper: given scroll_y/viewport_h, produce the range that should be
+    /// fetched from store for rendering (visible + overscan, clamped to store len).
+    #[must_use]
+    pub fn fetch_range(&self, scroll_y: f32, viewport_h: f32, total_rows: usize) -> Range<usize> {
+        let r = self.visible_range(scroll_y, viewport_h);
+        let end = r.end.min(total_rows);
+        let start = r.start.min(end);
+        start..end
     }
 }
 
@@ -56,6 +96,21 @@ pub struct ViewportSnapshot {
     pub rows: Arc<[Row]>,
     pub total: usize,
     pub state: StoreState,
+    /// Clamped offset used for this snapshot.
+    pub offset: usize,
+}
+
+impl ViewportSnapshot {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Whether the store has been truncated (rows evicted due to budget).
+    #[must_use]
+    pub fn is_truncated(&self, total_pushed: u64) -> bool {
+        total_pushed as usize > self.total
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +144,36 @@ mod tests {
         let snap = vp.snapshot(&store);
         assert_eq!(snap.rows.len(), 2);
         assert_eq!(snap.total, 5);
+    }
+
+    #[test]
+    fn clamped_offset() {
+        let vp = ViewportState {
+            offset: 100,
+            len: 25,
+            ..Default::default()
+        };
+        assert_eq!(vp.clamped_offset(30), 5);
+        assert_eq!(vp.clamped_offset(0), 0);
+    }
+
+    #[test]
+    fn total_height() {
+        let vp = ViewportState {
+            row_height: 22.0,
+            ..Default::default()
+        };
+        assert_eq!(vp.total_height(10), 220.0);
+    }
+
+    #[test]
+    fn fetch_range_clamped_to_total() {
+        let vp = ViewportState {
+            row_height: 20.0,
+            overscan: 2,
+            ..Default::default()
+        };
+        let r = vp.fetch_range(0.0, 100.0, 3);
+        assert!(r.end <= 3);
     }
 }

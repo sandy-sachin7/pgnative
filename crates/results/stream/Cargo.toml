@@ -19,4 +19,7 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 pgnative-results-value = { path = "../value" }

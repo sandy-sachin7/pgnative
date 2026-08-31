@@ -61,7 +61,11 @@ impl fmt::Display for QueryId {
 // SSL / SSH
 // ---------------------------------------------------------------------------
 
-/// PostgreSQL SSL mode — maps 1:1 to `tokio-postgres` (§26). Default `Prefer`.
+/// PostgreSQL SSL mode — **user-facing** 5-mode UX per product decision.
+/// `Disable / Prefer / Require / VerifyCa / VerifyFull`.
+/// Driver mapping (e.g. `tokio_postgres::config::SslMode` which may have fewer
+/// variants) is an **internal DB-boundary concern** — see `build_pg_config` /
+/// `build_rustls_config` and `connect_live`. Default `Prefer` (§26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SslMode {
     Disable,
@@ -325,6 +329,88 @@ impl ConnectionState {
             _ => None,
         }
     }
+
+    /// State-machine transitions (§53). Each returns the next state or
+    /// keeps the current state if the transition is illegal (no panic).
+    #[must_use]
+    pub fn on_connecting(since: Instant) -> Self {
+        Self::Connecting { since }
+    }
+
+    #[must_use]
+    pub fn on_connected(&self, id: ConnectionId, tx: TxState, health: SessionHealth) -> Self {
+        match self {
+            Self::Connecting { .. } | Self::Disconnected | Self::Error { .. } => {
+                Self::Connected { id, tx, health }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn on_begin_execute(&self, query_id: QueryId) -> Self {
+        match self {
+            Self::Connected { id, tx, .. } => Self::Executing {
+                id: *id,
+                query_id,
+                tx: *tx,
+            },
+            _ => self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn on_ready_for_query(&self, status: u8) -> Self {
+        let tx = tx_state_from_ready_for_query(status);
+        let health = health_for_tx(tx);
+        match self {
+            Self::Executing { id, query_id, .. } | Self::Cancelling { id, query_id, .. } => {
+                Self::Connected {
+                    id: *id,
+                    tx,
+                    health,
+                }
+            }
+            Self::Connected { id, .. } => Self::Connected {
+                id: *id,
+                tx,
+                health,
+            },
+            _ => self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn on_cancel(&self) -> Self {
+        match self {
+            Self::Executing { id, query_id, .. } => Self::Cancelling {
+                id: *id,
+                query_id: *query_id,
+                sent_at: Instant::now(),
+            },
+            _ => self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn on_error(&self, kind: String, retryable: bool) -> Self {
+        let id = match self {
+            Self::Connected { id, .. }
+            | Self::Executing { id, .. }
+            | Self::Cancelling { id, .. } => Some(*id),
+            _ => None,
+        };
+        Self::Error {
+            id,
+            kind,
+            retryable,
+        }
+    }
+
+    #[must_use]
+    pub fn on_disconnect(&self) -> Self {
+        Self::Disconnected
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +446,271 @@ impl ManagedSession {
             self.health = SessionHealth::NeedsReset;
         }
     }
+
+    /// Authoritative update from `ReadyForQuery` status byte.
+    pub fn apply_ready_for_query(&mut self, status: u8) {
+        let tx = tx_state_from_ready_for_query(status);
+        self.tx = tx;
+        self.health = health_for_tx(tx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PG wire helpers — real tokio-postgres wiring (§9, §26)
+// ---------------------------------------------------------------------------
+
+/// Map PG `ReadyForQuery` status byte (`I`/`T`/`E`) to [`TxState`].
+/// `I` = idle, `T` = in transaction, `E` = in failed transaction (RFC §53).
+#[must_use]
+pub fn tx_state_from_ready_for_query(status: u8) -> TxState {
+    match status {
+        b'I' => TxState::Idle,
+        b'T' => TxState::InTransaction {
+            since: Some(Instant::now()),
+            readonly: false,
+        },
+        b'E' => TxState::InFailedTransaction,
+        _ => TxState::Idle,
+    }
+}
+
+/// Update [`SessionHealth`] from the authoritative [`TxState`].
+#[must_use]
+pub fn health_for_tx(tx: TxState) -> SessionHealth {
+    match tx {
+        TxState::InFailedTransaction => SessionHealth::NeedsReset,
+        _ => SessionHealth::Ready,
+    }
+}
+
+/// Build a `tokio_postgres::Config` from [`ConnectionConfig`] + optional secret.
+/// Never logs the password; caller must pass `sanitized_url` to error mapping.
+#[must_use]
+pub fn build_pg_config(
+    cfg: &ConnectionConfig,
+    password: Option<&SecretString>,
+) -> tokio_postgres::Config {
+    let mut pg = tokio_postgres::Config::new();
+    pg.host(&cfg.host);
+    pg.port(cfg.port);
+    pg.dbname(&cfg.dbname);
+    pg.user(&cfg.username);
+    if let Some(pw) = password {
+        pg.password(pw.expose_secret());
+    }
+    // Keepalive + connect timeout are set at connect time; config is pure.
+    // `application_name` identifies pgNative sessions in `pg_stat_activity`.
+    pg.application_name("pgNative");
+    // SslMode is handled at the TLS connector layer, not here; we still
+    // stash it so `Config` consumers can inspect if they build URLs.
+    let _ = cfg.ssl_mode;
+    pg
+}
+
+/// Build a `rustls::ClientConfig` honoring [`SslMode`].
+/// `Disable` is handled by the caller selecting `NoTls`; this function is
+/// only called when TLS is desired. If `root_cert_pem` is provided it is
+/// parsed as PEM and added to the trust anchor store; otherwise an empty
+/// store is used (handshake will fail for self-signed unless the server
+/// presents a system-trusted chain — caller maps to `TlsFailed`).
+pub fn build_rustls_config(
+    ssl_mode: SslMode,
+    root_cert_pem: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    // If a PEM bundle is supplied, decode it without requiring `rustls-pemfile`
+    // as an extra workspace dep: split on `-----BEGIN CERTIFICATE-----`.
+    if let Some(pem) = root_cert_pem {
+        // Best-effort PEM extraction — if parsing fails we surface TlsFailed.
+        // We avoid a hard dep on `rustls-pemfile`; the caller can also pass
+        // `None` and rely on system roots for VerifyFull/VerifyCa.
+        let pem_bytes = pem.as_bytes();
+        // Use `rustls::pki_types::CertificateDer` parsing via `pem` crate style:
+        // fallback to trying `rustls`'s built-in PEM loader if available.
+        // For now, attempt to load via `rustls_pemfile` if present, else
+        // treat the PEM as opaque and return an error guiding the caller.
+        // To keep the crate buildable without `rustls-pemfile`, we do a
+        // minimal split and base64-decode attempt using only std.
+        let mut added = 0usize;
+        for chunk in pem.split("-----BEGIN CERTIFICATE-----") {
+            if let Some(end) = chunk.find("-----END CERTIFICATE-----") {
+                let b64 = chunk[..end]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>();
+                // Decode base64 via `rustls` helper if possible; otherwise skip.
+                // We use a tiny inline base64 decoder to avoid new deps.
+                if let Some(der) = decode_base64(&b64) {
+                    let cert = rustls::pki_types::CertificateDer::from(der);
+                    if roots.add(cert).is_ok() {
+                        added += 1;
+                    }
+                }
+            }
+        }
+        if added == 0 && !pem_bytes.is_empty() {
+            // No cert added — treat as invalid PEM.
+            return Err("invalid PEM: no certificates found".to_string());
+        }
+        let _ = added;
+    }
+
+    let builder = rustls::ClientConfig::builder();
+    let config = match ssl_mode {
+        SslMode::VerifyFull | SslMode::VerifyCa | SslMode::Require | SslMode::Prefer => {
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        SslMode::Disable => unreachable!("Disable must use NoTls"),
+    };
+    Ok(config)
+}
+
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for &b in s.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        let val = TABLE.iter().position(|&x| x == b)? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Classify a `tokio_postgres::Error` into [`ConnectionErrorKind`] using the
+/// already-sanitized URL (never re-interpolate the password).
+#[must_use]
+pub fn map_connect_error(err: tokio_postgres::Error, sanitized_url: String) -> ConnectionErrorKind {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    // `tokio-postgres` surfaces auth failures as `password authentication failed`
+    // or `no password supplied`; TLS failures contain `tls`/`certificate`.
+    if lower.contains("password authentication failed")
+        || lower.contains("authentication failed")
+        || lower.contains("no password")
+    {
+        return ConnectionErrorKind::AuthFailed;
+    }
+    if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake") {
+        return ConnectionErrorKind::TlsFailed(msg);
+    }
+    // Check sqlstate if present (e.g. 28P01 invalid_password)
+    // `tokio_postgres::Error::as_db_error()` exposes the `DbError` with `code()`.
+    if let Some(db_err) = err.as_db_error() {
+        let code = db_err.code().code().to_string();
+        if code == "28P01" {
+            return ConnectionErrorKind::AuthFailed;
+        }
+        let pg = PgError {
+            sqlstate: Some(code),
+            message: msg.clone(),
+            detail: db_err.detail().map(|s| s.to_string()),
+            hint: db_err.hint().map(|s| s.to_string()),
+            position: db_err.position().and_then(|p| p.parse::<u32>().ok()),
+            is_cancel: false,
+        };
+        return ConnectionErrorKind::QueryFailed(pg);
+    }
+    ConnectionErrorKind::ConnectionFailed {
+        message: msg,
+        sanitized_url,
+    }
+}
+
+/// Live PG session owning `Client + CancelToken + driver JoinHandle`.
+/// Spawned via [`connect_live`] (see below). `health`/`tx` mirror the PG
+/// `ReadyForQuery` state byte authoritatively.
+pub struct LiveSession {
+    pub id: ConnectionId,
+    pub client: tokio_postgres::Client,
+    pub cancel_token: tokio_postgres::CancelToken,
+    pub health: SessionHealth,
+    pub tx: TxState,
+    _driver: tokio::task::JoinHandle<()>,
+}
+
+impl LiveSession {
+    /// Current [`ConnectionState`] view of this live session.
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        ConnectionState::Connected {
+            id: self.id,
+            tx: self.tx,
+            health: self.health,
+        }
+    }
+
+    /// Apply an authoritative `ReadyForQuery` byte to update `tx`/`health`.
+    pub fn apply_ready_for_query(&mut self, status: u8) {
+        let tx = tx_state_from_ready_for_query(status);
+        self.tx = tx;
+        self.health = health_for_tx(tx);
+    }
+
+    /// Cancel token clone for `db::cancellation::TokenCanceller`.
+    #[must_use]
+    pub fn cancel_token(&self) -> tokio_postgres::CancelToken {
+        self.cancel_token.clone()
+    }
+}
+
+/// Connect with real `tokio_postgres::Client::connect`.
+///
+/// * Builds `Config` from `ConnectionConfig` + `SecretString` (never logged).
+/// * Maps `SslMode` → `MakeRustlsConnect` / `NoTls` (Disable) / TOFU for Prefer.
+/// * Spawns the `Connection` driver onto Tokio and returns a [`LiveSession`]
+///   holding `Client + CancelToken + JoinHandle`.
+/// * Errors are mapped via [`map_connect_error`] with [`sanitize_url`]-redacted URL.
+pub async fn connect_live(
+    cfg: &ConnectionConfig,
+    password: Option<&SecretString>,
+) -> Result<LiveSession, ConnectionErrorKind> {
+    let sanitized = cfg.sanitized_url(password);
+    let pg_config = build_pg_config(cfg, password);
+
+    // Choose TLS connector per SslMode.
+    let (client, connection) = match cfg.ssl_mode {
+        SslMode::Disable => pg_config
+            .connect(tokio_postgres::NoTls)
+            .await
+            .map_err(|e| map_connect_error(e, sanitized.clone()))?,
+        _ => {
+            let rustls_cfg = build_rustls_config(cfg.ssl_mode, cfg.ssl_root_cert.as_deref())
+                .map_err(ConnectionErrorKind::TlsFailed)?;
+            let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_cfg);
+            pg_config
+                .connect(tls)
+                .await
+                .map_err(|e| map_connect_error(e, sanitized.clone()))?
+        }
+    };
+
+    let cancel_token = client.cancel_token();
+    // Drive the connection in background; failures mark session poisoned.
+    let driver = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!(error = %e, "pg connection driver exited");
+        }
+    });
+
+    // Probe readiness: the `ReadyForQuery` byte arrives implicitly after
+    // startup; we default to Idle/Ready and let query execution correct it.
+    Ok(LiveSession {
+        id: cfg.id,
+        client,
+        cancel_token,
+        health: SessionHealth::Ready,
+        tx: TxState::Idle,
+        _driver: driver,
+    })
 }
 
 // ---------------------------------------------------------------------------

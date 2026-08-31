@@ -1,7 +1,15 @@
 //! Application orchestration — Command/Event, state machines, tx badge.
-//! Implements AGENTS.md §8, §29, §54 per plan D1/D2.
+//! Implements AGENTS.md §8, §24, §27-29, §30, §54 per plan D1/D2 + Track D.
+//!
+//! Track D adds:
+//! - `eframe::App` integration (`PgnativeApp`) wiring `ui::*` + `results::*`
+//!   + `schema/completion` into a single render loop per §29/§30.
+//! - SQLite file resolution + **versioned migrations** for connections/history/
+//!   editor_state/preferences per §27/§62.
+//! - OS keychain password resolution via `pgnative-storage-keychain` per §24.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -9,6 +17,10 @@ use parking_lot::RwLock;
 use pgnative_db_connection::{ConnectionId, ConnectionState, QueryId, TxState};
 use pgnative_schema_model::SchemaModel;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Commands / Events (unchanged API — extended with storage/keyring handling)
+// ---------------------------------------------------------------------------
 
 /// UI → App commands (§29).
 #[derive(Debug, Clone)]
@@ -113,7 +125,9 @@ impl AppState {
     }
 }
 
-/// Controller — owns channels + JoinSet (simplified for WU7).
+/// Controller — owns channels + optional Tokio JoinSet drain.
+///
+/// Channels are bounded (256) per §8 back-pressure contract.
 pub struct AppController {
     pub cmd_tx: Sender<AppCommand>,
     pub cmd_rx: Receiver<AppCommand>,
@@ -147,6 +161,425 @@ impl AppController {
         }
         out
     }
+
+    /// Non-blocking try_recv for eframe poll.
+    pub fn try_recv_command(&self) -> Option<AppCommand> {
+        self.cmd_rx.try_recv().ok()
+    }
+
+    pub fn emit(&self, ev: AppEvent) {
+        let _ = self.event_tx.send(ev);
+    }
+}
+
+impl Default for AppController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage: SQLite path + versioned migrations (§27, §62)
+// ---------------------------------------------------------------------------
+
+/// Current app DB schema version — bump on each breaking change to
+/// local storage. See `migrate()` for history.
+pub const APP_DB_VERSION: i32 = 2;
+
+/// Resolve platform-appropriate app DB path via `directories`.
+///
+/// On failure falls back to temp dir so tests/CI never panic.
+#[must_use]
+pub fn app_db_path() -> PathBuf {
+    if let Some(proj) = directories::ProjectDirs::from("com", "pgnative", "pgnative") {
+        let dir = proj.data_dir().to_path_buf();
+        // Ensure parent exists eagerly so callers can open directly.
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("pgnative.db")
+    } else {
+        std::env::temp_dir().join("pgnative.db")
+    }
+}
+
+/// Open (or create) the app SQLite DB and run versioned migrations.
+///
+/// Idempotent and safe to call on every startup. Uses `PRAGMA user_version`
+/// as the schema version marker (canonical SQLite pattern).
+pub fn open_app_db(path: &std::path::Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let conn = rusqlite::Connection::open(path)?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Run versioned migrations in order until `APP_DB_VERSION`.
+///
+/// Each step is additive and never destroys user data per §62.
+pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    // Cheap pragmas for app-local SQLite.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+    )?;
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    if version < 1 {
+        // v1: baseline tables from storage crates
+        pgnative_storage_connections::init(conn).map_err(|e| match e {
+            pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
+        })?;
+        pgnative_storage_history::init(conn).map_err(|e| match e {
+            pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
+        })?;
+        pgnative_storage_editor_state::init(conn).map_err(|e| match e {
+            pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
+        })?;
+        pgnative_storage_preferences::init(conn).map_err(|e| match e {
+            pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
+            pgnative_storage_preferences::PrefError::Json(_) => {
+                rusqlite::Error::InvalidParameterName("json".into())
+            }
+        })?;
+        conn.execute("PRAGMA user_version=1", [])?;
+    }
+    if version < 2 {
+        // v2: add updated_at column to connections if missing (backwards-aware)
+        // and create index on history.connection_id
+        let has_updated: bool = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='connections'")
+            .ok()
+            .and_then(|mut s| {
+                s.query_row([], |r| r.get::<_, Option<String>>(0))
+                    .ok()
+                    .flatten()
+            })
+            .map(|sql| sql.contains("updated_at"))
+            .unwrap_or(false);
+        if !has_updated {
+            // ALTER TABLE is idempotent via try; ignore if column exists
+            let _ = conn.execute(
+                "ALTER TABLE connections ADD COLUMN updated_at INTEGER DEFAULT NULL",
+                [],
+            );
+        }
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_connection ON history(connection_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC)",
+            [],
+        );
+        conn.execute("PRAGMA user_version=2", [])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Keyring integration (§24) — non-secret in SQLite, secret in OS keychain
+// ---------------------------------------------------------------------------
+
+/// Resolve password for a connection from the OS keychain.
+///
+/// Returns `None` if absent (caller should prompt), never logs the secret.
+/// Wraps `pgnative_storage_keychain::get_password` with sanitized error mapping.
+#[must_use]
+pub fn resolve_password(id: ConnectionId) -> Option<secrecy::SecretString> {
+    pgnative_storage_keychain::get_password(id.0).ok()
+}
+
+/// Persist password to OS keychain.
+pub fn store_password(
+    id: ConnectionId,
+    password: secrecy::SecretString,
+) -> Result<(), pgnative_storage_keychain::KeychainError> {
+    pgnative_storage_keychain::set_password(id.0, password)
+}
+
+/// Remove password from keychain on connection deletion.
+pub fn delete_password(id: ConnectionId) -> Result<(), pgnative_storage_keychain::KeychainError> {
+    pgnative_storage_keychain::delete_password(id.0)
+}
+
+// ---------------------------------------------------------------------------
+// eframe integration — PgnativeApp (§30: render is pure, no SQL/FS blocking)
+// ---------------------------------------------------------------------------
+
+/// Top-level eframe app wiring explorer/editor/results/layout/theme/history.
+///
+/// All heavy work (DB, storage, keychain) happens via `AppCommand` dispatch
+/// on a Tokio task or the controller channel — `update()` only drains events
+/// and renders from snapshot state per §30.
+pub struct PgnativeApp {
+    pub controller: AppController,
+    pub ui_state: pgnative_ui_layout::UiState,
+    pub viewport: pgnative_results_viewport::ViewportState,
+    pub theme: pgnative_ui_theme::Theme,
+    pub schema: Option<Arc<SchemaModel>>,
+    pub editor_tabs: HashMap<String, pgnative_ui_editor::EditorTab>,
+    pub active_tab: Option<String>,
+    pub history_query: String,
+    pub history_results: Vec<String>,
+    pub connection_form: pgnative_ui_connections::ConnectionForm,
+    /// Shared result store (populated by async execution layer).
+    pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
+}
+
+impl PgnativeApp {
+    #[must_use]
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Apply theme eagerly
+        let theme = pgnative_ui_theme::Theme::dark();
+        cc.egui_ctx.set_visuals(theme.visuals());
+
+        // Restore UI state from SQLite preferences if present
+        let mut ui_state = pgnative_ui_layout::UiState::default();
+        if let Ok(conn) = open_app_db(&app_db_path()) {
+            if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
+                if let Ok(restored) = serde_json::from_value::<pgnative_ui_layout::UiState>(v) {
+                    ui_state = restored;
+                }
+            }
+        }
+
+        Self {
+            controller: AppController::new(),
+            ui_state,
+            viewport: pgnative_results_viewport::ViewportState::default(),
+            theme,
+            schema: None,
+            editor_tabs: HashMap::new(),
+            active_tab: None,
+            history_query: String::new(),
+            history_results: Vec::new(),
+            connection_form: pgnative_ui_connections::ConnectionForm::default(),
+            store: Arc::new(parking_lot::RwLock::new(
+                pgnative_results_store::ResultStore::new(
+                    pgnative_results_store::StoreConfig::default(),
+                ),
+            )),
+        }
+    }
+
+    fn poll_events(&mut self) {
+        for ev in self.controller.drain_events() {
+            match ev {
+                AppEvent::SchemaUpdated { model, .. } => {
+                    self.schema = Some(model);
+                }
+                AppEvent::ConnectionStateChanged { state, .. } => {
+                    tracing::info!(state = %state, "connection state");
+                }
+                AppEvent::Error { op, message } => {
+                    tracing::warn!(op = %op, message = %message, "app error");
+                }
+                AppEvent::DisconnectRequiresDecision { id } => {
+                    tracing::warn!(%id, "disconnect requires decision — active tx");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl eframe::App for PgnativeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll controller events (non-blocking) before render
+        self.poll_events();
+
+        // Top bar: connection + theme toggle
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("pgNative");
+                if ui.button("New Tab").clicked() {
+                    let id = format!("tab-{}", self.editor_tabs.len() + 1);
+                    self.editor_tabs
+                        .insert(id.clone(), pgnative_ui_editor::EditorTab::new(id.clone()));
+                    self.active_tab = Some(id);
+                    self.controller.send_command(AppCommand::HistorySearch {
+                        query: String::new(),
+                    });
+                }
+                if ui.button("Refresh Schema").clicked() {
+                    // Use first connection if any
+                    if let Some((&id, _)) = self.controller.state.connections.iter().next() {
+                        self.controller
+                            .send_command(AppCommand::RefreshSchema { connection: id });
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if self.theme.is_dark { "Light" } else { "Dark" };
+                    if ui.button(label).clicked() {
+                        self.theme = if self.theme.is_dark {
+                            pgnative_ui_theme::Theme::light()
+                        } else {
+                            pgnative_ui_theme::Theme::dark()
+                        };
+                        ctx.set_visuals(self.theme.visuals());
+                    }
+                });
+            });
+        });
+
+        // Left: explorer — reads Arc<SchemaModel> snapshot, filterable
+        let schema_clone = self.schema.clone();
+        egui::SidePanel::left("explorer")
+            .resizable(true)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.heading("Explorer");
+                ui.text_edit_singleline(&mut self.ui_state.search);
+                let model_ref = schema_clone.as_deref();
+                pgnative_ui_explorer::show_explorer(ui, model_ref, &self.ui_state.search);
+            });
+
+        // Right: history panel (FTS) — driven by HistorySearch command
+        egui::SidePanel::right("history")
+            .resizable(true)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("History");
+                let resp = ui.text_edit_singleline(&mut self.history_query);
+                if resp.changed() {
+                    self.controller.send_command(AppCommand::HistorySearch {
+                        query: self.history_query.clone(),
+                    });
+                }
+                pgnative_ui_history_panel::show_history(
+                    ui,
+                    &self.history_query,
+                    &self.history_results,
+                );
+            });
+
+        // Central: editor tabs + virtualized results grid
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Editor
+            ui.horizontal(|ui| {
+                for tab_id in self.editor_tabs.keys().cloned().collect::<Vec<_>>() {
+                    let selected = self.active_tab.as_deref() == Some(&tab_id);
+                    if ui.selectable_label(selected, &tab_id).clicked() {
+                        self.active_tab = Some(tab_id.clone());
+                    }
+                }
+            });
+            if let Some(tab_id) = self.active_tab.clone() {
+                if let Some(tab) = self.editor_tabs.get_mut(&tab_id) {
+                    let mut content = tab.content.clone();
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut content)
+                            .desired_rows(12)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("SELECT * FROM ..."),
+                    );
+                    if resp.changed() {
+                        tab.content = content;
+                        tab.cursor = tab.content.len();
+                        // Persist editor tab content (best-effort, no blocking toast)
+                        if let Ok(conn) = open_app_db(&app_db_path()) {
+                            let _ = pgnative_storage_editor_state::upsert(
+                                &conn,
+                                &pgnative_storage_editor_state::EditorTab {
+                                    tab_id: tab.id.clone(),
+                                    connection_id: None,
+                                    content: tab.content.clone(),
+                                    cursor: tab.cursor,
+                                },
+                            );
+                        }
+                    }
+                    // Completion preview (engine built from current schema snapshot)
+                    if let Some(schema) = &self.schema {
+                        let engine = pgnative_schema_completion::CompletionEngine::new(schema);
+                        // Prefix = last word before cursor
+                        let prefix = tab
+                            .content
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or("")
+                            .to_string();
+                        if !prefix.is_empty() {
+                            let completions = pgnative_ui_editor::completions_for(&engine, &prefix);
+                            if !completions.is_empty() {
+                                ui.label(format!("completions: {}", completions.join(", ")));
+                            }
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Run (Ctrl+Enter)").clicked() {
+                            if let Some((&conn_id, _)) =
+                                self.controller.state.connections.iter().next()
+                            {
+                                self.controller.send_command(AppCommand::Execute {
+                                    tab: tab.id.clone(),
+                                    sql: tab.content.clone(),
+                                    connection: conn_id,
+                                });
+                            }
+                        }
+                        if ui.button("Cancel (Esc)").clicked() {
+                            // Cancel last query if any
+                            if let Some((qid, _)) = self.controller.state.queries.iter().next() {
+                                self.controller
+                                    .send_command(AppCommand::Cancel { query_id: *qid });
+                            }
+                        }
+                    });
+                }
+            }
+
+            ui.separator();
+
+            // Virtualized results — only visible + overscan rows (§18)
+            let store_guard = self.store.read();
+            let snap = self.viewport.snapshot(&store_guard);
+            drop(store_guard);
+            // Show via ui/results helper (ScrollArea::show_rows internally)
+            pgnative_ui_results::show_results(ui, &self.viewport, &snap);
+            ui.label(format!(
+                "rows: {} total (state: {:?})",
+                snap.rows.len(),
+                snap.state
+            ));
+        });
+
+        // Connections panel at bottom (collapsible)
+        egui::TopBottomPanel::bottom("connections").show(ctx, |ui| {
+            ui.collapsing("Connections", |ui| {
+                pgnative_ui_connections::show_connections(ui, &mut self.connection_form);
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        let id = ConnectionId(Uuid::new_v4());
+                        self.controller.send_command(AppCommand::Connect { id });
+                    }
+                });
+            });
+        });
+
+        // Repaint when streaming results
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Launch the native eframe window.
+///
+/// Uses `directories` for storage path, Tokio runtime re-used from `eframe`
+/// winit loop where available. Returns `eframe::Result` for caller (e.g. `main.rs`).
+pub fn run_native() -> eframe::Result<()> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_title("pgNative"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "pgNative",
+        opts,
+        Box::new(|cc| Ok(Box::new(PgnativeApp::new(cc)))),
+    )
 }
 
 #[cfg(test)]
@@ -170,5 +603,36 @@ mod tests {
         });
         let cmd = c.cmd_rx.try_recv().unwrap();
         assert!(matches!(cmd, AppCommand::HistorySearch { .. }));
+    }
+
+    #[test]
+    fn migrations_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // second run must be no-op
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, APP_DB_VERSION);
+    }
+
+    #[test]
+    fn app_db_path_non_empty() {
+        let p = app_db_path();
+        assert!(!p.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn open_app_db_creates_file() {
+        let path = std::env::temp_dir().join(format!("pgnative-test-{}.db", Uuid::new_v4()));
+        let conn = open_app_db(&path).unwrap();
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, APP_DB_VERSION);
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 }

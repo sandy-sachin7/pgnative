@@ -1,7 +1,17 @@
-//! Safe inline editing — PK-gated, parameterized UPDATE ... RETURNING * (§20, §21).
+//! Safe inline editing — PK-gated, parameterized UPDATE-only (§20, §21).
+//! Product decision: UPDATE only in v1, No MERGE. Edits disabled inside explicit
+//! transactions (Idle vs InTransaction/InFailedTransaction per §22).
 use pgnative_schema_model::relation::Relation;
 use pgnative_schema_model::types::Editability;
 use thiserror::Error;
+
+/// Transaction state as seen by the editor — stringified `TxState` from
+/// `pgnative-db-connection` to avoid a DB dep. `Idle` means editable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxForEdit {
+    Idle,
+    Active(String),
+}
 
 #[derive(Debug, Error)]
 pub enum EditError {
@@ -9,6 +19,14 @@ pub enum EditError {
     NotEditable(String),
     #[error("no changes")]
     NoChanges,
+    /// Edit attempted while explicit transaction is active — must commit/rollback first.
+    #[error(
+        "edit disabled: explicit transaction {state:?} active — commit or rollback before editing"
+    )]
+    InTransaction { state: TxForEdit },
+    /// MERGE is not supported in v1 — use UPDATE only.
+    #[error("MERGE not supported in v1 — use UPDATE only")]
+    MergeNotSupported,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +38,17 @@ pub struct ColumnDiff {
 
 pub fn is_editable(rel: &Relation) -> bool {
     rel.editability() != Editability::Disabled
+}
+
+/// Product decision: edits disabled when explicit transaction is active.
+/// Pass `TxForEdit::Idle` for editable, `Active(_)` for blocked.
+/// Callers map `pgnative_db_connection::TxState` → `TxForEdit` via `tx.to_string()`.
+#[must_use]
+pub fn can_edit_in_tx(tx: TxForEdit) -> Result<(), EditError> {
+    match tx {
+        TxForEdit::Idle => Ok(()),
+        s => Err(EditError::InTransaction { state: s }),
+    }
 }
 
 /// Compute diff skipping GENERATED/IDENTITY/Virtual (§20).
@@ -57,6 +86,7 @@ pub fn diff_columns(
 }
 
 /// Generate parameterized `UPDATE "table" SET "col"=$1 WHERE pk=$N RETURNING *`.
+/// Product decision: UPDATE only — MERGE is rejected.
 pub fn update_sql(
     rel: &Relation,
     diffs: &[ColumnDiff],
@@ -97,6 +127,14 @@ pub fn update_sql(
     );
     let params = diffs.iter().map(|d| d.new.clone()).collect();
     Ok((sql, params))
+}
+
+/// Explicitly rejected: MERGE in v1.
+pub fn merge_sql(
+    _rel: &Relation,
+    _diffs: &[ColumnDiff],
+) -> Result<(String, Vec<String>), EditError> {
+    Err(EditError::MergeNotSupported)
 }
 
 #[cfg(test)]

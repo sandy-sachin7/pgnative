@@ -12,7 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-parking_lot = { workspace = true }
+arc-swap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 pgnative-schema-model = { path = "../model" }
