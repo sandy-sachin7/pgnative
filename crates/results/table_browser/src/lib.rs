@@ -164,7 +164,7 @@ mod tests {
                 id: *id,
                 owner: Id(0),
                 name: (*n).into(),
-                position: (i + 1) as i32,
+                position: (i + 1) as u16,
                 ty: Id(0),
                 nullability: Nullability::NotNull,
                 has_default: false,
