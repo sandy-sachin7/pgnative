@@ -126,11 +126,11 @@ mod tests {
     #[test]
     fn browsable_with_pk() {
         let col = Column {
-            id: ColumnId(Id(0)),
+            id: Id(0),
             owner: Id(0),
             name: "id".into(),
             position: 1,
-            ty: TypeId(Id(0)),
+            ty: Id(0),
             nullability: Nullability::NotNull,
             has_default: false,
             default_expr: None,
