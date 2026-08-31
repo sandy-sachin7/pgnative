@@ -1,0 +1,16 @@
+[package]
+name = "pgnative-results-viewport"
+description = "Viewport snapshot for virtualized rendering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pgnative-results-value = { path = "../value" }
+pgnative-results-store = { path = "../store" }

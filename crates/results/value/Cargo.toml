@@ -1,0 +1,19 @@
+[package]
+name = "pgnative-results-value"
+description = "Bounded PostgreSQL value and row representation for result display."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bigdecimal = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }

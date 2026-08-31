@@ -1,0 +1,113 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/db/cancellation",
+    "crates/db/connection",
+    "crates/db/execution",
+    "crates/db/introspection",
+    "crates/observability",
+    "crates/results/edit",
+    "crates/results/export",
+    "crates/results/store",
+    "crates/results/stream",
+    "crates/results/table_browser",
+    "crates/results/value",
+    "crates/results/viewport",
+    "crates/schema/cache",
+    "crates/schema/completion",
+    "crates/schema/model",
+    "crates/storage/connections",
+    "crates/storage/editor_state",
+    "crates/storage/history",
+    "crates/storage/keychain",
+    "crates/storage/preferences",
+    "crates/ui/connections",
+    "crates/ui/editor",
+    "crates/ui/explorer",
+    "crates/ui/history_panel",
+    "crates/ui/layout",
+    "crates/ui/results",
+    "crates/ui/shortcuts",
+    "crates/ui/theme",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/anomalyco/pgnative"
+authors = ["pgNative contributors"]
+
+[workspace.dependencies]
+# --- UI ---
+eframe = { version = "0.36.1", default-features = false }
+egui = { version = "0.36.1", default-features = false }
+egui_extras = { version = "0.36.1", default-features = false }
+
+# --- Async runtime ---
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+futures = "0.3.34"
+
+# --- Database ---
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+tokio-postgres-rustls = "0.14.0"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "logging", "tls12"] }
+postgres-types = { version = "0.2.14", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+postgres-protocol = "0.6.12"
+bigdecimal = "0.4.10"
+
+# --- Local storage ---
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+directories = "6.0.0"
+
+# --- Credentials / security ---
+keyring = { version = "4.2.0" }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+url = "2.5.8"
+
+# --- Data model / values ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock"] }
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+smol_str = "0.3.6"
+bytes = "1.12.1"
+arcstr = "1.2.0"
+
+# --- Concurrency ---
+crossbeam-channel = "0.5.15"
+parking_lot = "0.12.5"
+async-trait = "0.1.88"
+
+# --- Errors / logging ---
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# --- Export ---
+csv = "1.4"
+
+# --- Testing ---
+testcontainers = "0.28.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = { level = "warn", priority = -1 }
+unused = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+# Documented exceptions to pedantic. Rationale recorded per rule.
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

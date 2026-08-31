@@ -1,0 +1,20 @@
+[package]
+name = "pgnative-storage-keychain"
+description = "OS keychain wrapper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keyring = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+pgnative-db-connection = { path = "../../db/connection" }
