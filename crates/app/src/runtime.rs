@@ -67,14 +67,23 @@ pub fn spawn_runtime(
             match cmd {
                 AppCommand::Connect { id } => {
                     let ev_tx = event_tx.clone();
-                    let Some(cfg) = load_connection_config(id) else {
+                    // SQLite I/O must not block the Tokio worker (§7 fix).
+                    let cfg_opt = tokio::task::spawn_blocking(move || load_connection_config(id))
+                        .await
+                        .ok()
+                        .flatten();
+                    let Some(cfg) = cfg_opt else {
                         let _ = ev_tx.try_send(AppEvent::Error {
                             op: "connect".into(),
                             message: format!("unknown connection {id}"),
                         });
                         continue;
                     };
-                    let pw = crate::resolve_password(id);
+                    // Keychain access may hit D-Bus/secret-service — also blocking.
+                    let pw = tokio::task::spawn_blocking(move || crate::resolve_password(id))
+                        .await
+                        .ok()
+                        .flatten();
                     match connect_live(&cfg, pw.as_ref()).await {
                         Ok(sess) => {
                             let conn_id = sess.id;
@@ -343,14 +352,36 @@ pub fn spawn_runtime(
                                 entry.cancel.cancel_query(tokio_postgres::NoTls).await
                             }
                             _ => {
-                                if let Ok(cfg) = pgnative_db_connection::build_rustls_config(
+                                match pgnative_db_connection::build_rustls_config(
                                     entry.ssl_mode,
                                     entry.ssl_root_cert.as_deref(),
                                 ) {
-                                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(cfg);
-                                    entry.cancel.cancel_query(tls).await
-                                } else {
-                                    entry.cancel.cancel_query(tokio_postgres::NoTls).await
+                                    Ok(cfg) => {
+                                        let tls =
+                                            tokio_postgres_rustls::MakeRustlsConnect::new(cfg);
+                                        entry.cancel.cancel_query(tls).await
+                                    }
+                                    Err(e) => {
+                                        // Never fallback to NoTls — would leak pid/secret in plaintext
+                                        // on hostssl servers (C1). Mark Poisoned directly.
+                                        tracing::warn!(
+                                            connection = %entry.connection,
+                                            error = %e,
+                                            "TLS config for cancel failed — not sending plaintext CancelRequest"
+                                        );
+                                        if let Some(sess) = sessions.get_mut(&entry.connection) {
+                                            sess.health =
+                                                pgnative_db_connection::SessionHealth::Poisoned;
+                                        }
+                                        // Treat as cancel failure — poisoned path below will also handle,
+                                        // but we short-circuit to avoid fabricating tokio_postgres::Error.
+                                        entry.handle.abort();
+                                        let _ = event_tx.try_send(AppEvent::QueryFinished {
+                                            query_id,
+                                            success: false,
+                                        });
+                                        continue;
+                                    }
                                 }
                             }
                         };

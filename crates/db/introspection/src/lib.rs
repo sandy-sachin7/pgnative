@@ -104,8 +104,16 @@ pub async fn fetch_relations(
         let oid: u32 = r.get(0);
         let ns: u32 = r.get(1);
         let name: String = r.get(2);
-        let kind_s: String = r.get(3);
-        let kind = kind_s.chars().next().unwrap_or('r');
+        // relkind is PG "char" (not text) → comes as i8 via postgres-protocol
+        let kind: char = {
+            // Try i8 first (canonical), fallback to String for text-mode encodings
+            if let Ok(v) = r.try_get::<usize, i8>(3) {
+                v as u8 as char
+            } else {
+                let s: String = r.get(3);
+                s.chars().next().unwrap_or('r')
+            }
+        };
         let comment: Option<String> = r.get(4);
         out.push((Oid(oid), Oid(ns), name, kind, comment));
     }
@@ -139,8 +147,17 @@ pub async fn fetch_columns(
         let attnotnull: bool = r.get(5);
         let atthasdef: bool = r.get(6);
         let default_expr: Option<String> = r.get(7);
-        let attgenerated: String = r.get(8);
-        let attidentity: String = r.get(9);
+        // attgenerated / attidentity are PG "char" → i8
+        let attgenerated: String = if let Ok(v) = r.try_get::<usize, i8>(8) {
+            (v as u8 as char).to_string()
+        } else {
+            r.get(8)
+        };
+        let attidentity: String = if let Ok(v) = r.try_get::<usize, i8>(9) {
+            (v as u8 as char).to_string()
+        } else {
+            r.get(9)
+        };
         // atthasdef is redundant — has_default derived from default_expr is_some.
         let _ = atthasdef;
         out.push((
@@ -166,8 +183,12 @@ pub async fn fetch_constraints_pk_unique(
     for r in rows {
         let conrelid: u32 = r.get(0);
         let conname: String = r.get(1);
-        let contype_s: String = r.get(2);
-        let contype = contype_s.chars().next().unwrap_or('p');
+        let contype: char = if let Ok(v) = r.try_get::<usize, i8>(2) {
+            v as u8 as char
+        } else {
+            let s: String = r.get(2);
+            s.chars().next().unwrap_or('p')
+        };
         let conkey: Option<Vec<i16>> = r.get(3);
         out.push((Oid(conrelid), conname, contype, conkey));
     }
@@ -209,8 +230,12 @@ pub async fn fetch_functions(
         let proname: String = r.get(2);
         let args: String = r.get(3);
         let rettype: String = r.get(4);
-        let prokind_s: String = r.get(5);
-        let prokind = prokind_s.chars().next().unwrap_or('f');
+        let prokind: char = if let Ok(v) = r.try_get::<usize, i8>(5) {
+            v as u8 as char
+        } else {
+            let s: String = r.get(5);
+            s.chars().next().unwrap_or('f')
+        };
         // Build display signature: name(args)
         let signature = format!("{proname}({args})");
         out.push((Oid(oid), Oid(ns), proname, signature, rettype, prokind));
