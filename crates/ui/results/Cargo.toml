@@ -15,4 +15,5 @@ workspace = true
 egui = { workspace = true }
 egui_extras = { workspace = true }
 pgnative-results-value = { path = "../../results/value" }
+pgnative-results-store = { path = "../../results/store" }
 pgnative-results-viewport = { path = "../../results/viewport" }
