@@ -474,7 +474,9 @@ mod tests {
         };
         let (tx, mut rx) = channel(&cfg);
         let rows = (0..5).map(|i| vec![Some(format!("{i}").into_bytes()), Some(b"hello".to_vec())]);
-        drive_iter(rows, cols, cfg, tx).await;
+        // Run producer concurrently: with channel_cap=2 the 3rd send would block
+        // forever if we awaited drive_iter before draining rx (deadlock).
+        let producer = tokio::spawn(drive_iter(rows, cols, cfg, tx));
         // Should receive Meta, then batches of 2,2,1 then Complete
         let mut batches = 0;
         let mut total_rows = 0;
@@ -498,6 +500,7 @@ mod tests {
         assert!(saw_complete);
         assert_eq!(total_rows, 5);
         assert_eq!(batches, 3);
+        producer.await.unwrap();
     }
 
     #[tokio::test]
