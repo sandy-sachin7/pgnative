@@ -45,7 +45,7 @@ authors = ["Sandy Sachin"]
 # --- UI ---
 eframe = { version = "0.36.1", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
-egui_extras = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
+egui_extras = { version = "0.36.1", default-features = false }
 
 # --- Async runtime ---
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
