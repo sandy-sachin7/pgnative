@@ -53,3 +53,7 @@ pgnative-ui-layout = { path = "../ui/layout" }
 pgnative-ui-connections = { path = "../ui/connections" }
 pgnative-ui-history-panel = { path = "../ui/history_panel" }
 pgnative-ui-theme = { path = "../ui/theme" }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+url = { workspace = true }

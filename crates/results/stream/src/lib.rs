@@ -286,18 +286,101 @@ where
             Ok(pg_row) => {
                 let mut cells = Vec::with_capacity(oids.len());
                 for (i, oid) in oids.iter().enumerate() {
-                    // Text-protocol decode via `Option<&str>` (covers all types in text
-                    // format; bytea arrives as \x hex which decode_cell handles).
-                    // For OID 17 when PG sends binary, fall back to `&[u8]`.
-                    let raw: Option<&[u8]> = if *oid == 17 {
-                        // Try binary bytea first via raw bytes, else text hex.
-                        pg_row
-                            .get::<usize, Option<&[u8]>>(i)
-                            .or_else(|| pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes()))
-                    } else {
-                        pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes())
+                    // PG may send binary for scalar types (int2/int4/int8/float/bool)
+                    // when using `query_raw` with prepared statement — `get::<&str>`
+                    // then panics with "error deserializing column".
+                    // Try typed binary decode first, fall back to text `&str`.
+                    let cv = match oid {
+                        16 => match pg_row.try_get::<usize, Option<bool>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Bool),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        21 => match pg_row.try_get::<usize, Option<i16>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::SmallInt),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        23 => match pg_row.try_get::<usize, Option<i32>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Int),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        20 => match pg_row.try_get::<usize, Option<i64>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::BigInt),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        700 => match pg_row.try_get::<usize, Option<f32>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Float),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        701 => match pg_row.try_get::<usize, Option<f64>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Double),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        17 => {
+                            if let Ok(Some(b)) = pg_row.try_get::<usize, Option<&[u8]>>(i) {
+                                CellValue::Bytea(Bytes::copy_from_slice(b))
+                            } else {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        }
+                        _ => {
+                            let raw = pg_row
+                                .try_get::<usize, Option<&str>>(i)
+                                .ok()
+                                .flatten()
+                                .map(|s| s.as_bytes())
+                                .or_else(|| {
+                                    pg_row.try_get::<usize, Option<&[u8]>>(i).ok().flatten()
+                                });
+                            decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                        }
                     };
-                    let cv = decode_cell_with_cap(raw, *oid, config.per_cell_cap);
                     cells.push(cv);
                 }
                 batch.push(Row::new(cells));
