@@ -386,12 +386,13 @@ impl PgnativeApp {
 }
 
 impl eframe::App for PgnativeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Poll controller events (non-blocking) before render
         self.poll_events();
+        let ctx = ui.ctx().clone();
 
         // Top bar: connection + theme toggle
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("pgNative");
                 if ui.button("New Tab").clicked() {
@@ -426,10 +427,10 @@ impl eframe::App for PgnativeApp {
 
         // Left: explorer — reads Arc<SchemaModel> snapshot, filterable
         let schema_clone = self.schema.clone();
-        egui::SidePanel::left("explorer")
+        egui::Panel::left("explorer")
             .resizable(true)
             .default_width(260.0)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.heading("Explorer");
                 ui.text_edit_singleline(&mut self.ui_state.search);
                 let model_ref = schema_clone.as_deref();
@@ -437,10 +438,10 @@ impl eframe::App for PgnativeApp {
             });
 
         // Right: history panel (FTS) — driven by HistorySearch command
-        egui::SidePanel::right("history")
+        egui::Panel::right("history")
             .resizable(true)
             .default_width(280.0)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.heading("History");
                 let resp = ui.text_edit_singleline(&mut self.history_query);
                 if resp.changed() {
@@ -456,7 +457,7 @@ impl eframe::App for PgnativeApp {
             });
 
         // Central: editor tabs + virtualized results grid
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Editor
             ui.horizontal(|ui| {
                 for tab_id in self.editor_tabs.keys().cloned().collect::<Vec<_>>() {
@@ -487,6 +488,7 @@ impl eframe::App for PgnativeApp {
                                     connection_id: None,
                                     content: tab.content.clone(),
                                     cursor: tab.cursor,
+                                    selection: None,
                                 },
                             );
                         }
@@ -538,7 +540,7 @@ impl eframe::App for PgnativeApp {
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
             // Show via ui/results helper (ScrollArea::show_rows internally)
-            pgnative_ui_results::show_results(ui, &self.viewport, &snap);
+            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &[]);
             ui.label(format!(
                 "rows: {} total (state: {:?})",
                 snap.rows.len(),
@@ -547,7 +549,7 @@ impl eframe::App for PgnativeApp {
         });
 
         // Connections panel at bottom (collapsible)
-        egui::TopBottomPanel::bottom("connections").show(ctx, |ui| {
+        egui::Panel::bottom("connections").show(ui, |ui| {
             ui.collapsing("Connections", |ui| {
                 pgnative_ui_connections::show_connections(ui, &mut self.connection_form);
                 ui.horizontal(|ui| {
