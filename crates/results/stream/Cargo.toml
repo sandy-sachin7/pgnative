@@ -18,4 +18,5 @@ postgres-types = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 pgnative-results-value = { path = "../value" }
