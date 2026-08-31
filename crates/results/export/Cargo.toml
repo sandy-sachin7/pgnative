@@ -17,4 +17,5 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+csv = { workspace = true }
 pgnative-results-value = { path = "../value" }
