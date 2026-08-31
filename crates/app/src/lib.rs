@@ -429,7 +429,7 @@ impl eframe::App for PgnativeApp {
         let schema_clone = self.schema.clone();
         egui::Panel::left("explorer")
             .resizable(true)
-            .default_width(260.0)
+            .default_size(260.0)
             .show(ui, |ui| {
                 ui.heading("Explorer");
                 ui.text_edit_singleline(&mut self.ui_state.search);
@@ -440,7 +440,7 @@ impl eframe::App for PgnativeApp {
         // Right: history panel (FTS) — driven by HistorySearch command
         egui::Panel::right("history")
             .resizable(true)
-            .default_width(280.0)
+            .default_size(280.0)
             .show(ui, |ui| {
                 ui.heading("History");
                 let resp = ui.text_edit_singleline(&mut self.history_query);
