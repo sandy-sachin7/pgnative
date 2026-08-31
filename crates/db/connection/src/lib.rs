@@ -614,7 +614,9 @@ pub fn map_connect_error(err: tokio_postgres::Error, sanitized_url: String) -> C
             message: msg.clone(),
             detail: db_err.detail().map(|s| s.to_string()),
             hint: db_err.hint().map(|s| s.to_string()),
-            position: db_err.position().and_then(|p| p.parse::<u32>().ok()),
+            position: db_err
+                .position()
+                .and_then(|p| p.to_string().parse::<u32>().ok()),
             is_cancel: false,
         };
         return ConnectionErrorKind::QueryFailed(pg);
@@ -676,30 +678,40 @@ pub async fn connect_live(
     let sanitized = cfg.sanitized_url(password);
     let pg_config = build_pg_config(cfg, password);
 
-    // Choose TLS connector per SslMode.
-    let (client, connection) = match cfg.ssl_mode {
-        SslMode::Disable => pg_config
-            .connect(tokio_postgres::NoTls)
-            .await
-            .map_err(|e| map_connect_error(e, sanitized.clone()))?,
+    // Choose TLS connector per SslMode — each arm spawns its own driver
+    // to avoid `match` returning incompatible `Connection<Socket, NoTlsStream>`
+    // vs `Connection<Socket, RustlsStream>` types (E0308).
+    let (client, cancel_token, driver) = match cfg.ssl_mode {
+        SslMode::Disable => {
+            let (client, conn) = pg_config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| map_connect_error(e, sanitized.clone()))?;
+            let token = client.cancel_token();
+            let driver = tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::warn!(error = %e, "pg connection driver exited");
+                }
+            });
+            (client, token, driver)
+        }
         _ => {
             let rustls_cfg = build_rustls_config(cfg.ssl_mode, cfg.ssl_root_cert.as_deref())
                 .map_err(ConnectionErrorKind::TlsFailed)?;
             let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_cfg);
-            pg_config
+            let (client, conn) = pg_config
                 .connect(tls)
                 .await
-                .map_err(|e| map_connect_error(e, sanitized.clone()))?
+                .map_err(|e| map_connect_error(e, sanitized.clone()))?;
+            let token = client.cancel_token();
+            let driver = tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::warn!(error = %e, "pg connection driver exited");
+                }
+            });
+            (client, token, driver)
         }
     };
-
-    let cancel_token = client.cancel_token();
-    // Drive the connection in background; failures mark session poisoned.
-    let driver = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::warn!(error = %e, "pg connection driver exited");
-        }
-    });
 
     // Probe readiness: the `ReadyForQuery` byte arrives implicitly after
     // startup; we default to Idle/Ready and let query execution correct it.
