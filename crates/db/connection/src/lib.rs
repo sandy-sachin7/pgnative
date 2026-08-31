@@ -100,7 +100,7 @@ pub struct SshTunnelConfig {
 // ---------------------------------------------------------------------------
 
 /// Non-secret part persisted in SQLite; `password` lives in OS keychain.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectionConfig {
     pub id: ConnectionId,
     pub name: String,

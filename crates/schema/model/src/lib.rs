@@ -11,5 +11,7 @@ pub mod relation;
 pub mod schema;
 pub mod types;
 
+pub use index::SchemaModel;
+
 #[cfg(test)]
 mod tests;
