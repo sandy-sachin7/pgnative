@@ -126,6 +126,10 @@ impl ResultStore {
 
 /// Thread-safe handle: `Arc<RwLock<ResultStore>>` — mutated only by Tokio task,
 /// read lock-free in render via `snapshot_range`.
+/// Note (crates/results/store/src/lib.rs:129): parking_lot RwLock is not held
+/// across `.await`; all write locks are short critical sections in `push_batch`
+/// / `complete` / `cancel` (no await inside), and read locks are held only
+/// for `snapshot_range` copy. No async lock needed; Tokio task is the sole writer.
 pub type SharedStore = Arc<RwLock<ResultStore>>;
 
 #[must_use]

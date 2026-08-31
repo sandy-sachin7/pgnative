@@ -32,13 +32,29 @@ pub fn spawn_runtime(
 
         // Bridge crossbeam (sync, UI thread) -> tokio mpsc with a single blocking thread
         // instead of per-command spawn_blocking churn (§8).
+        // Channel cap 256 prevents flood; try_send+retry avoids blocking_send deadlock
+        // (crates/app/src/runtime.rs:38) where bridge thread could block forever if
+        // receiver stalls. Abort on shutdown via bridge_handle.abort().
         let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<AppCommand>(256);
         // Single dedicated thread forwards commands; exits when crossbeam disconnects
         // or bridge is closed (runtime shutdown).
         let bridge_handle = tokio::task::spawn_blocking(move || {
             while let Ok(cmd) = cmd_rx.recv() {
-                if bridge_tx.blocking_send(cmd).is_err() {
-                    break;
+                let mut pending: Option<AppCommand> = Some(cmd);
+                while let Some(c) = pending.take() {
+                    match bridge_tx.try_send(c) {
+                        Ok(()) => break,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(ret)) => {
+                            if bridge_tx.is_closed() {
+                                return;
+                            }
+                            // Channel full (256) — back off briefly then retry to avoid
+                            // blocking forever (crates/app/src/runtime.rs:38)
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            pending = Some(ret);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
                 }
             }
         });
@@ -157,6 +173,21 @@ pub fn spawn_runtime(
                     // §16: never silently rewrite user SQL with LIMIT/OFFSET; LIMIT belongs
                     // only in table-browser queries (crates/results/table_browser).
                     let sql_exec = sql.clone();
+                    // Fix race (crates/app/src/runtime.rs:160): insert placeholder BEFORE spawn
+                    // so Cancel arriving immediately after qid creation finds the entry.
+                    // QGuard will remove entry on drop, ensuring no leak on fast prepare error.
+                    let placeholder = tokio::spawn(std::future::pending::<()>());
+                    queries.lock().insert(
+                        qid,
+                        QueryEntry {
+                            id: qid,
+                            connection,
+                            cancel,
+                            ssl_mode,
+                            ssl_root_cert: ssl_root_cert.clone(),
+                            handle: placeholder,
+                        },
+                    );
                     let handle = tokio::spawn(async move {
                         struct QGuard {
                             qid: QueryId,
@@ -293,17 +324,16 @@ pub fn spawn_runtime(
                             }
                         }
                     });
-                    queries.lock().insert(
-                        qid,
-                        QueryEntry {
-                            id: qid,
-                            connection,
-                            cancel,
-                            ssl_mode,
-                            ssl_root_cert,
-                            handle,
-                        },
-                    );
+                    // Swap placeholder with real handle; if Cancel raced and removed entry, abort new task
+                    {
+                        let mut qs = queries.lock();
+                        if let Some(entry) = qs.get_mut(&qid) {
+                            entry.handle.abort();
+                            entry.handle = handle;
+                        } else {
+                            handle.abort();
+                        }
+                    }
                 }
                 AppCommand::Cancel { query_id } => {
                     let entry_opt = { queries.lock().remove(&query_id) };

@@ -10,7 +10,10 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Per-cell byte cap (§19) — large text/json/bytea truncated at stream.
-pub const PER_CELL_CAP: usize = 256 * 1024;
+/// Budget: 64 KiB per cell vs 64 MiB store (§15) and channel_cap=16 (§C2)
+/// mitigates worst-case memory; theoretical 10×64 KiB×10 cols ≈ 6.4 MiB per
+/// batch is bounded by store eviction.
+pub const PER_CELL_CAP: usize = 64 * 1024;
 
 /// Render truncation cap (viewport shows affordance beyond this).
 pub const RENDER_CAP: usize = 2 * 1024;
@@ -104,13 +107,19 @@ pub fn decode_cell_with_cap(raw: Option<&[u8]>, oid: u32, cap: usize) -> CellVal
         return CellValue::Null;
     };
     // Truncate large values at stream — UTF-8 safe at char boundary (C8).
+    // TODO(§19): truncated jsonb/bytea coerced to Text; preserve variant
+    // after truncation if downstream needs type fidelity.
     if bytes.len() > cap {
         let mut end = cap;
         while end > 0 && !is_utf8_boundary(bytes, end) {
             end -= 1;
         }
-        // If even 1 byte not valid boundary (rare), fall back to lossy truncation
-        let truncated = &bytes[..end.max(1).min(bytes.len())];
+        if end == 0 {
+            // cap landed inside first char (cap=1 with multi-byte); return empty
+            // rather than reintroducing invalid UTF-8 via max(1) (crates/results/stream/src/lib.rs:107)
+            return CellValue::Text(Bytes::new());
+        }
+        let truncated = &bytes[..end.min(bytes.len())];
         return CellValue::Text(Bytes::copy_from_slice(truncated));
     }
     match oid {

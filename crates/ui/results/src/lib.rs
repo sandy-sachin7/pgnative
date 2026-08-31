@@ -112,11 +112,14 @@ pub fn format_cell(v: &CellValue) -> String {
         | CellValue::Other(b)
             if b.len() > 2048 =>
         {
-            format!(
-                "{}… ({} bytes — expand)",
-                String::from_utf8_lossy(&b[..2048]),
-                b.len()
-            )
+            // Slice at char boundary (crates/ui/results/src/lib.rs:115) — avoid splitting UTF-8
+            let mut end = 2048.min(b.len());
+            // Walk back until char boundary: continuation bytes 0b10xxxxxx are not boundaries
+            while end > 0 && end < b.len() && (b[end] & 0b1100_0000) == 0b1000_0000 {
+                end -= 1;
+            }
+            let s = String::from_utf8_lossy(&b[..end]);
+            format!("{s}… ({} bytes — expand)", b.len())
         }
         CellValue::Bytea(b) if b.len() > 2048 => {
             format!("\\x{}… ({} bytes)", hex_snippet(b, 64), b.len())

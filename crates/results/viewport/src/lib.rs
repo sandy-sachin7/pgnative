@@ -31,10 +31,12 @@ impl Default for ViewportState {
 }
 
 impl ViewportState {
-    /// Compute visible row range from scroll.
+    /// Compute visible row range from scroll (crates/results/viewport/src/lib.rs:39).
     /// `scroll_y` = current scroll offset, `viewport_h` = visible height.
-    /// Includes overscan rows above and below for smooth scrolling.
-    /// Uses f64 to avoid f32 precision loss beyond 2^24 (~16M) for 500k+ rows.
+    /// Includes `overscan` rows above *and* below visible window for smooth
+    /// scrolling (total extra = 2×overscan). Clamped by caller via
+    /// `fetch_range` to `total_rows`. Uses f64 to avoid f32 precision loss
+    /// beyond 2^24 (~16M) for 500k+ rows.
     #[must_use]
     pub fn visible_range(&self, scroll_y: f32, viewport_h: f32) -> Range<usize> {
         let h = self.row_height as f64;
@@ -43,6 +45,8 @@ impl ViewportState {
         }
         let first = ((scroll_y as f64) / h).floor().max(0.0) as usize;
         let visible = ((viewport_h as f64) / h).ceil().max(0.0) as usize;
+        // start includes overscan above, end includes visible + overscan below
+        // (crates/results/viewport/src/lib.rs:39 overscan double intentional, documented)
         let start = first.saturating_sub(self.overscan);
         let end = first.saturating_add(visible).saturating_add(self.overscan);
         start..end
