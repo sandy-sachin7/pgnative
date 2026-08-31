@@ -122,12 +122,11 @@ impl ConnectionConfig {
     #[must_use]
     pub fn sanitized_url(&self, password: Option<&SecretString>) -> String {
         // Build then sanitize — never interpolate password directly.
-        let pw_present = password.is_some();
-        let raw = if pw_present {
+        let raw = if let Some(pw) = password {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
                 self.username,
-                password.unwrap().expose_secret(),
+                pw.expose_secret(),
                 self.host,
                 self.port,
                 self.dbname,
@@ -168,11 +167,15 @@ pub fn sanitize_url(raw: &str) -> String {
         if url.password().is_some() {
             let _ = url.set_password(Some("***"));
         }
-        // Also strip `password=` query param if present (JDBC style).
+        // Also strip sensitive query params (JDBC style): password, passwd, pwd, secret, token
         let redacted_query = url
             .query_pairs()
             .map(|(k, v)| {
-                if k == "password" {
+                let kl = k.to_ascii_lowercase();
+                if matches!(
+                    kl.as_str(),
+                    "password" | "passwd" | "pwd" | "secret" | "token"
+                ) {
                     format!("{k}=***")
                 } else {
                     format!("{k}={v}")
@@ -189,15 +192,18 @@ pub fn sanitize_url(raw: &str) -> String {
         }
         return url.to_string();
     }
-    // Fallback: replace `password=...` substring.
+    // Fallback: replace sensitive key=... substrings (case-insensitive)
     let mut out = raw.to_string();
-    if let Some(idx) = out.to_lowercase().find("password=") {
-        let start = idx + "password=".len();
-        if let Some(end) = out[start..].find(['&', ' ']) {
-            out.replace_range(start..start + end, "***");
-        } else {
-            out.truncate(start);
-            out.push_str("***");
+    for key in ["password=", "passwd=", "pwd=", "secret=", "token="] {
+        let low = out.to_ascii_lowercase();
+        if let Some(idx) = low.find(key) {
+            let start = idx + key.len();
+            if let Some(end) = out[start..].find(['&', ' ']) {
+                out.replace_range(start..start + end, "***");
+            } else {
+                out.truncate(start);
+                out.push_str("***");
+            }
         }
     }
     out
@@ -627,10 +633,19 @@ pub struct LiveSession {
     pub cancel_token: tokio_postgres::CancelToken,
     pub health: SessionHealth,
     pub tx: TxState,
-    _driver: tokio::task::JoinHandle<()>,
+    pub ssl_mode: SslMode,
+    pub ssl_root_cert: Option<String>,
+    driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LiveSession {
+    /// Abort the driver task. Called on disconnect to avoid leaking detached driver.
+    pub fn abort_driver(&mut self) {
+        if let Some(h) = self.driver.take() {
+            h.abort();
+        }
+    }
+
     /// Current [`ConnectionState`] view of this live session.
     #[must_use]
     pub fn state(&self) -> ConnectionState {
@@ -652,6 +667,23 @@ impl LiveSession {
     #[must_use]
     pub fn cancel_token(&self) -> tokio_postgres::CancelToken {
         self.cancel_token.clone()
+    }
+
+    /// Issue a `CancelRequest` using the correct TLS connector for this session.
+    /// `Disable` uses `NoTls`; all other modes use `MakeRustlsConnect` built from
+    /// the same `SslMode`/`ssl_root_cert` used at connect time — avoids leaking
+    /// `pid/secret` in plaintext and failing on `hostssl` servers (§26).
+    pub async fn cancel_query_via_tls(&self) -> Result<(), tokio_postgres::Error> {
+        match self.ssl_mode {
+            SslMode::Disable => self.cancel_token.cancel_query(tokio_postgres::NoTls).await,
+            _ => match build_rustls_config(self.ssl_mode, self.ssl_root_cert.as_deref()) {
+                Ok(rustls_cfg) => {
+                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_cfg);
+                    self.cancel_token.cancel_query(tls).await
+                }
+                Err(_) => self.cancel_token.cancel_query(tokio_postgres::NoTls).await,
+            },
+        }
     }
 }
 
@@ -712,7 +744,9 @@ pub async fn connect_live(
         cancel_token,
         health: SessionHealth::Ready,
         tx: TxState::Idle,
-        _driver: driver,
+        ssl_mode: cfg.ssl_mode,
+        ssl_root_cert: cfg.ssl_root_cert.clone(),
+        driver: Some(driver),
     })
 }
 

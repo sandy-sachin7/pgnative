@@ -36,6 +36,9 @@ pgnative-db-connection = { path = "../db/connection" }
 pgnative-db-introspection = { path = "../db/introspection" }
 pgnative-results-stream = { path = "../results/stream" }
 tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 pgnative-storage-connections = { path = "../storage/connections" }

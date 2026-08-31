@@ -2686,15 +2686,18 @@ dependencies = [
  "pgnative-ui-results",
  "pgnative-ui-theme",
  "rusqlite",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

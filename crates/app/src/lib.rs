@@ -153,7 +153,13 @@ impl AppController {
     }
 
     pub fn send_command(&self, cmd: AppCommand) {
-        let _ = self.cmd_tx.send(cmd);
+        // §30: never block UI thread; drop oldest if full (bounded 256)
+        if let Err(crossbeam_channel::TrySendError::Full(cmd)) = self.cmd_tx.try_send(cmd) {
+            tracing::warn!("cmd channel full — dropping command");
+            // Make room: drop one pending and retry once
+            let _ = self.cmd_rx.try_recv();
+            let _ = self.cmd_tx.try_send(cmd);
+        }
     }
 
     pub fn drain_events(&self) -> Vec<AppEvent> {
@@ -170,7 +176,8 @@ impl AppController {
     }
 
     pub fn emit(&self, ev: AppEvent) {
-        let _ = self.event_tx.send(ev);
+        // Non-blocking; drop if UI not draining fast enough
+        let _ = self.event_tx.try_send(ev);
     }
 }
 
@@ -539,10 +546,19 @@ impl eframe::App for PgnativeApp {
                     }
                     // Completion preview — cache engine per schema Arc ptr per §30.
                     if let Some(schema) = &self.schema {
-                        let ptr = Arc::as_ptr(schema) as *const pgnative_schema_model::SchemaModel;
+                        let ptr = Arc::as_ptr(schema);
                         let engine: Arc<pgnative_schema_completion::CompletionEngine> =
                             if self.completion_schema_ptr == Some(ptr) {
-                                Arc::clone(self.completion_cache.as_ref().unwrap())
+                                if let Some(cached) = self.completion_cache.as_ref() {
+                                    Arc::clone(cached)
+                                } else {
+                                    let e = Arc::new(
+                                        pgnative_schema_completion::CompletionEngine::new(schema),
+                                    );
+                                    self.completion_cache = Some(Arc::clone(&e));
+                                    self.completion_schema_ptr = Some(ptr);
+                                    e
+                                }
                             } else {
                                 let e = Arc::new(
                                     pgnative_schema_completion::CompletionEngine::new(schema),

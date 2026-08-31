@@ -15,6 +15,15 @@ pub const PER_CELL_CAP: usize = 256 * 1024;
 /// Render truncation cap (viewport shows affordance beyond this).
 pub const RENDER_CAP: usize = 2 * 1024;
 
+#[inline]
+fn is_utf8_boundary(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 || idx >= bytes.len() {
+        return true;
+    }
+    // Continuation bytes 10xxxxxx are not boundaries
+    (bytes[idx] & 0b1100_0000) != 0b1000_0000
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
     pub per_cell_cap: usize,
@@ -26,8 +35,8 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             per_cell_cap: PER_CELL_CAP,
-            batch_size: 256,
-            channel_cap: 512,
+            batch_size: 64,
+            channel_cap: 16,
         }
     }
 }
@@ -94,15 +103,14 @@ pub fn decode_cell_with_cap(raw: Option<&[u8]>, oid: u32, cap: usize) -> CellVal
     let Some(bytes) = raw else {
         return CellValue::Null;
     };
-    // Truncate large values at stream — renderer shows affordance (C8).
-    let truncated = if bytes.len() > cap {
-        &bytes[..cap]
-    } else {
-        bytes
-    };
-    // If truncated, we always return Text with truncated bytes (authoritative).
-    let was_truncated = bytes.len() > cap;
-    if was_truncated {
+    // Truncate large values at stream — UTF-8 safe at char boundary (C8).
+    if bytes.len() > cap {
+        let mut end = cap;
+        while end > 0 && !is_utf8_boundary(bytes, end) {
+            end -= 1;
+        }
+        // If even 1 byte not valid boundary (rare), fall back to lossy truncation
+        let truncated = &bytes[..end.max(1).min(bytes.len())];
         return CellValue::Text(Bytes::copy_from_slice(truncated));
     }
     match oid {

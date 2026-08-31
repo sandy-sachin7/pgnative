@@ -69,12 +69,14 @@ pub enum IntrospectionError {
 // Client-bound fetch helpers
 // ---------------------------------------------------------------------------
 
-/// Set introspection session parameters (statement_timeout 5s, default read-only).
-/// Uses `SET default_transaction_read_only` (session-scoped) instead of
-/// `SET TRANSACTION` which is transaction-scoped and invalid outside a txn.
+/// Set introspection session parameters (statement_timeout 5s).
+/// Previously set `default_transaction_read_only=on` session-scoped, which
+/// leaked to user queries and broke writes (§7). Now only sets timeout;
+/// introspection queries are read-only by nature and don't need session
+/// persistence. Caller may wrap introspection in `BEGIN READ ONLY` if desired.
 pub async fn prepare_session(client: &tokio_postgres::Client) -> Result<(), IntrospectionError> {
     client
-        .batch_execute("SET statement_timeout = '5s'; SET default_transaction_read_only = on;")
+        .batch_execute("SET statement_timeout = '5s';")
         .await?;
     Ok(())
 }
@@ -307,7 +309,7 @@ pub mod hydrate {
         // 1) Schemas — dense Ids, oid→SchemaId map.
         let mut schema_by_oid: HashMap<Oid, Id> = HashMap::new();
         for (idx, (oid, name, comment)) in schemas.into_iter().enumerate() {
-            let id = Id(idx as u32);
+            let id = Id(u32::try_from(idx).expect("schema idx fits u32"));
             schema_by_oid.insert(oid, id);
             b.add_schema(Schema { id, name, comment });
         }
@@ -394,7 +396,7 @@ pub mod hydrate {
                 'p' => RelationKind::Table, // partitioned table treated as Table
                 _ => RelationKind::Table,
             };
-            let rel_id = Id(idx as u32);
+            let rel_id = Id(u32::try_from(idx).expect("relation idx fits u32"));
             rel_by_oid.insert(rel_oid, rel_id);
 
             // Columns for this relation
@@ -552,7 +554,7 @@ pub mod hydrate {
                 .get(&ns_oid)
                 .copied()
                 .unwrap_or(fallback_schema);
-            let fid = Id(idx as u32);
+            let fid = Id(u32::try_from(idx).expect("function idx fits u32"));
             b.add_function(Function {
                 id: fid,
                 schema,

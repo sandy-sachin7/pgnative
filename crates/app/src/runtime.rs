@@ -14,6 +14,8 @@ struct QueryEntry {
     id: QueryId,
     connection: ConnectionId,
     cancel: tokio_postgres::CancelToken,
+    ssl_mode: SslMode,
+    ssl_root_cert: Option<String>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -25,7 +27,8 @@ pub fn spawn_runtime(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sessions: SessionMap = HashMap::new();
-        let mut queries: HashMap<QueryId, QueryEntry> = HashMap::new();
+        let queries: Arc<parking_lot::Mutex<HashMap<QueryId, QueryEntry>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
         loop {
             let cmd = {
@@ -44,7 +47,7 @@ pub fn spawn_runtime(
                 AppCommand::Connect { id } => {
                     let ev_tx = event_tx.clone();
                     let Some(cfg) = load_connection_config(id) else {
-                        let _ = ev_tx.send(AppEvent::Error {
+                        let _ = ev_tx.try_send(AppEvent::Error {
                             op: "connect".into(),
                             message: format!("unknown connection {id}"),
                         });
@@ -58,7 +61,7 @@ pub fn spawn_runtime(
                                 let mut s = state.write();
                                 s.connections.insert(conn_id, sess.state());
                             }
-                            let _ = ev_tx.send(AppEvent::ConnectionStateChanged {
+                            let _ = ev_tx.try_send(AppEvent::ConnectionStateChanged {
                                 id: conn_id,
                                 state: "connected".into(),
                             });
@@ -68,13 +71,13 @@ pub fn spawn_runtime(
                                 Ok(model) => {
                                     let arc = Arc::new(model);
                                     state.write().set_schema((*arc).clone());
-                                    let _ = ev_tx.send(AppEvent::SchemaUpdated {
+                                    let _ = ev_tx.try_send(AppEvent::SchemaUpdated {
                                         connection: conn_id,
                                         model: arc,
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = ev_tx.send(AppEvent::Error {
+                                    let _ = ev_tx.try_send(AppEvent::Error {
                                         op: "introspect".into(),
                                         message: e.to_string(),
                                     });
@@ -83,7 +86,7 @@ pub fn spawn_runtime(
                             sessions.insert(conn_id, sess);
                         }
                         Err(e) => {
-                            let _ = ev_tx.send(AppEvent::Error {
+                            let _ = ev_tx.try_send(AppEvent::Error {
                                 op: "connect".into(),
                                 message: e.to_string(),
                             });
@@ -99,12 +102,28 @@ pub fn spawn_runtime(
                     }
                 }
                 AppCommand::Disconnect { id } => {
-                    sessions.remove(&id);
+                    if let Some(mut sess) = sessions.remove(&id) {
+                        sess.abort_driver();
+                    }
                     state.write().connections.remove(&id);
-                    let _ = event_tx.send(AppEvent::ConnectionStateChanged {
+                    let _ = event_tx.try_send(AppEvent::ConnectionStateChanged {
                         id,
                         state: "disconnected".into(),
                     });
+                    // Abort and clean up any queries still tied to this connection
+                    {
+                        let mut qs = queries.lock();
+                        let to_abort: Vec<QueryId> = qs
+                            .iter()
+                            .filter(|(_, e)| e.connection == id)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for qid in to_abort {
+                            if let Some(e) = qs.remove(&qid) {
+                                e.handle.abort();
+                            }
+                        }
+                    }
                 }
                 AppCommand::Execute {
                     tab: _,
@@ -112,7 +131,7 @@ pub fn spawn_runtime(
                     connection,
                 } => {
                     let Some(sess) = sessions.get(&connection) else {
-                        let _ = event_tx.send(AppEvent::Error {
+                        let _ = event_tx.try_send(AppEvent::Error {
                             op: "execute".into(),
                             message: "not connected".into(),
                         });
@@ -121,20 +140,38 @@ pub fn spawn_runtime(
                     let qid = QueryId::new();
                     state.write().queries.insert(qid, sql.clone());
                     let cancel = sess.cancel_token();
+                    let ssl_mode = sess.ssl_mode;
+                    let ssl_root_cert = sess.ssl_root_cert.clone();
                     let client = std::sync::Arc::clone(&sess.client);
                     let ev_tx = event_tx.clone();
                     let store_clone = store.clone();
                     let sql_for_history = sql.clone();
                     let conn_for_history = connection;
-                    let sql_limited = if is_select_without_limit(&sql) {
-                        format!("{} LIMIT 100", sql.trim_end().trim_end_matches(';'))
-                    } else {
-                        sql.clone()
-                    };
+                    let queries_clone = Arc::clone(&queries);
+                    let state_clone = Arc::clone(&state);
+                    // §16: never silently rewrite user SQL with LIMIT/OFFSET; LIMIT belongs
+                    // only in table-browser queries (crates/results/table_browser).
+                    let sql_exec = sql.clone();
                     let handle = tokio::spawn(async move {
+                        struct QGuard {
+                            qid: QueryId,
+                            queries: Arc<parking_lot::Mutex<HashMap<QueryId, QueryEntry>>>,
+                            state: Arc<parking_lot::RwLock<AppState>>,
+                        }
+                        impl Drop for QGuard {
+                            fn drop(&mut self) {
+                                self.queries.lock().remove(&self.qid);
+                                self.state.write().queries.remove(&self.qid);
+                            }
+                        }
+                        let _qguard = QGuard {
+                            qid,
+                            queries: queries_clone,
+                            state: state_clone,
+                        };
                         let start = std::time::Instant::now();
                         // Prepare first to get column metadata, then stream with empty params.
-                        let stmt_res = client.prepare(&sql_limited).await;
+                        let stmt_res = client.prepare(&sql_exec).await;
                         let (stmt_metas, stream_res) = match stmt_res {
                             Ok(s) => {
                                 let metas: Vec<pgnative_results_stream::ColumnMeta> = s
@@ -147,11 +184,11 @@ pub fn spawn_runtime(
                                 (metas, r)
                             }
                             Err(e) => {
-                                let _ = ev_tx.send(AppEvent::Error {
+                                let _ = ev_tx.try_send(AppEvent::Error {
                                     op: "query".into(),
                                     message: e.to_string(),
                                 });
-                                let _ = ev_tx.send(AppEvent::QueryFinished {
+                                let _ = ev_tx.try_send(AppEvent::QueryFinished {
                                     query_id: qid,
                                     success: false,
                                 });
@@ -181,7 +218,7 @@ pub fn spawn_runtime(
                                             {
                                                 store_clone.write().push_batch(batch);
                                             }
-                                            let _ = ev_tx.send(AppEvent::QueryProgress {
+                                            let _ = ev_tx.try_send(AppEvent::QueryProgress {
                                                 query_id: qid,
                                                 rows: total,
                                             });
@@ -191,7 +228,7 @@ pub fn spawn_runtime(
                                             ..
                                         } => {
                                             store_clone.write().complete();
-                                            let _ = ev_tx.send(AppEvent::QueryFinished {
+                                            let _ = ev_tx.try_send(AppEvent::QueryFinished {
                                                 query_id: qid,
                                                 success: true,
                                             });
@@ -224,11 +261,11 @@ pub fn spawn_runtime(
                                         }
                                         pgnative_results_stream::StreamEvent::Error(e) => {
                                             store_clone.write().cancel();
-                                            let _ = ev_tx.send(AppEvent::Error {
+                                            let _ = ev_tx.try_send(AppEvent::Error {
                                                 op: "query".into(),
                                                 message: e.to_string(),
                                             });
-                                            let _ = ev_tx.send(AppEvent::QueryFinished {
+                                            let _ = ev_tx.try_send(AppEvent::QueryFinished {
                                                 query_id: qid,
                                                 success: false,
                                             });
@@ -240,32 +277,50 @@ pub fn spawn_runtime(
                                 let _ = drive.await;
                             }
                             Err(e) => {
-                                let _ = ev_tx.send(AppEvent::Error {
+                                let _ = ev_tx.try_send(AppEvent::Error {
                                     op: "query".into(),
                                     message: e.to_string(),
                                 });
-                                let _ = ev_tx.send(AppEvent::QueryFinished {
+                                let _ = ev_tx.try_send(AppEvent::QueryFinished {
                                     query_id: qid,
                                     success: false,
                                 });
                             }
                         }
                     });
-                    queries.insert(
+                    queries.lock().insert(
                         qid,
                         QueryEntry {
                             id: qid,
                             connection,
                             cancel,
+                            ssl_mode,
+                            ssl_root_cert,
                             handle,
                         },
                     );
                 }
                 AppCommand::Cancel { query_id } => {
-                    if let Some(entry) = queries.remove(&query_id) {
-                        let _ = entry.cancel.cancel_query(tokio_postgres::NoTls).await;
+                    let entry_opt = { queries.lock().remove(&query_id) };
+                    if let Some(entry) = entry_opt {
+                        match entry.ssl_mode {
+                            SslMode::Disable => {
+                                let _ = entry.cancel.cancel_query(tokio_postgres::NoTls).await;
+                            }
+                            _ => {
+                                if let Ok(cfg) = pgnative_db_connection::build_rustls_config(
+                                    entry.ssl_mode,
+                                    entry.ssl_root_cert.as_deref(),
+                                ) {
+                                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(cfg);
+                                    let _ = entry.cancel.cancel_query(tls).await;
+                                } else {
+                                    let _ = entry.cancel.cancel_query(tokio_postgres::NoTls).await;
+                                }
+                            }
+                        }
                         entry.handle.abort();
-                        let _ = event_tx.send(AppEvent::QueryFinished {
+                        let _ = event_tx.try_send(AppEvent::QueryFinished {
                             query_id,
                             success: false,
                         });
@@ -281,13 +336,13 @@ pub fn spawn_runtime(
                                 Ok(model) => {
                                     let arc = Arc::new(model);
                                     state_clone.write().set_schema((*arc).clone());
-                                    let _ = ev_tx.send(AppEvent::SchemaUpdated {
+                                    let _ = ev_tx.try_send(AppEvent::SchemaUpdated {
                                         connection,
                                         model: arc,
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = ev_tx.send(AppEvent::Error {
+                                    let _ = ev_tx.try_send(AppEvent::Error {
                                         op: "refresh_schema".into(),
                                         message: e.to_string(),
                                     });
@@ -307,7 +362,7 @@ pub fn spawn_runtime(
                                 .map(|e| e.query_text)
                                 .collect::<Vec<_>>()
                                 .join("\n---\n");
-                            let _ = ev_tx.send(AppEvent::Error {
+                            let _ = ev_tx.try_send(AppEvent::Error {
                                 op: "history".into(),
                                 message: joined,
                             });
@@ -315,7 +370,7 @@ pub fn spawn_runtime(
                     });
                 }
                 AppCommand::Export { query_id, format } => {
-                    let _ = event_tx.send(AppEvent::Error {
+                    let _ = event_tx.try_send(AppEvent::Error {
                         op: "export".into(),
                         message: format!("export {query_id} {format:?} not yet implemented"),
                     });
@@ -367,12 +422,4 @@ fn load_saved(
         username: row.get(5).ok()?,
         ssl_mode: row.get(6).ok()?,
     })
-}
-
-fn is_select_without_limit(sql: &str) -> bool {
-    let s = sql.trim().to_ascii_lowercase();
-    if !s.starts_with("select") {
-        return false;
-    }
-    !s.contains("limit")
 }

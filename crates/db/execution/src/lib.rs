@@ -105,7 +105,12 @@ pub struct InMemoryExecutor;
 #[async_trait::async_trait]
 impl Executor for InMemoryExecutor {
     async fn execute(&self, req: QueryRequest) -> Result<ExecutionHandle, ExecutionError> {
-        debug!(query_id = %req.query_id, sql = %req.sql, "execute (in-memory)");
+        // §35: never log raw SQL (may contain INSERT secrets); only log id/len
+        debug!(
+            query_id = %req.query_id,
+            sql_len = req.sql.len(),
+            "execute (in-memory)"
+        );
         Ok(ExecutionHandle::new(req.query_id))
     }
 
