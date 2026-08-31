@@ -614,9 +614,9 @@ pub fn map_connect_error(err: tokio_postgres::Error, sanitized_url: String) -> C
             message: msg.clone(),
             detail: db_err.detail().map(|s| s.to_string()),
             hint: db_err.hint().map(|s| s.to_string()),
-            position: db_err
-                .position()
-                .and_then(|p| p.to_string().parse::<u32>().ok()),
+            // ErrorPosition is an enum without Display/ToString — store None
+            // (position string is available via `detail`/`message` if needed).
+            position: None,
             is_cancel: false,
         };
         return ConnectionErrorKind::QueryFailed(pg);
