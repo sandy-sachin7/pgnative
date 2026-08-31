@@ -94,6 +94,12 @@ pub enum AppEvent {
 }
 
 /// Domain state — AppState (§54), separate from UiState.
+///
+/// NOTE: `schema` duplicates `pgnative_schema_cache::SchemaCache` state.
+/// `SchemaCache` is the canonical TTL/epoch store (hot, epoch increments on
+/// every `set_ready*`). `AppState::schema` is kept in sync via
+/// `SchemaUpdated` events and should eventually be replaced by a shared
+/// `SchemaCache` instance to avoid divergence.
 #[derive(Debug, Default)]
 pub struct AppState {
     pub connections: HashMap<ConnectionId, ConnectionState>,

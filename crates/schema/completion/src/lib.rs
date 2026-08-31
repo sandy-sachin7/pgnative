@@ -133,12 +133,318 @@ impl CompletionEngine {
 }
 
 /// Extract `FROM/JOIN ... [AS] alias` map from SQL up to `cursor` offset.
+///
+/// Minimal hand-rolled scan for `(?i)\bFROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?`
+/// and `JOIN` similarly — no full SQL parser, best-effort per §14.
+/// `cursor` is a byte offset clamped to `sql.len()`. Table and alias keys
+/// are lower-cased. When a model is available, prefer
+/// `extract_aliases_with_model` to resolve table names to `RelationId`.
 #[must_use]
 pub fn extract_aliases(sql: &str, cursor: usize) -> HashMap<String, RelationId> {
-    // Placeholder: real impl parses last FROM/JOIN before cursor.
-    // WU6 keeps hand-rolled FROM|JOIN regex; alias resolution is best-effort.
-    let _ = (sql, cursor);
-    HashMap::new()
+    let raw = extract_alias_map(sql, cursor);
+    // Without a model we cannot resolve real RelationIds; fabricate stable
+    // ids by hashing the table name so `alias → id` is at least deterministic
+    // and distinct per table (caller with a model should use `_with_model`).
+    let mut out = HashMap::new();
+    for (alias, table) in raw {
+        // simple fnv-1a hash to u32
+        let mut hash: u32 = 2166136261;
+        for b in table.as_bytes() {
+            hash ^= u32::from(*b);
+            hash = hash.wrapping_mul(16777619);
+        }
+        let id = pgnative_schema_model::types::Id(hash);
+        out.insert(alias, id);
+        // also insert table itself → id so `users.` works without alias
+        out.entry(table).or_insert(id);
+    }
+    out
+}
+
+/// Best-effort alias → table name map (both lower-cased) from `sql[..cursor]`.
+#[must_use]
+pub fn extract_alias_map(sql: &str, cursor: usize) -> HashMap<String, String> {
+    let end = cursor.min(sql.len());
+    let slice = &sql[..end];
+    let mut out = HashMap::new();
+    // Scan for FROM / JOIN keywords case-insensitively.
+    let bytes = slice.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip non-alpha
+        if !bytes[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        // Check for FROM (4 chars) or JOIN (4 chars)
+        let is_from = i + 4 <= len
+            && slice[i..i + 4].eq_ignore_ascii_case("from")
+            && is_word_boundary(slice, i, 4);
+        let is_join = i + 4 <= len
+            && slice[i..i + 4].eq_ignore_ascii_case("join")
+            && is_word_boundary(slice, i, 4);
+        if !is_from && !is_join {
+            i += 1;
+            continue;
+        }
+        i += 4;
+        // Skip whitespace
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        // Capture table name (allow schema-qualified a.b and quoted "a")
+        let table = capture_ident(slice, &mut i);
+        if table.is_empty() {
+            continue;
+        }
+        // Table key is the unqualified lowercased name and also fully-qualified lowercased.
+        // Extract short name after last dot.
+        let short_table = table
+            .rsplit('.')
+            .next()
+            .unwrap_or(&table)
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        let full_table = table.trim_matches('"').to_ascii_lowercase();
+
+        // Skip whitespace
+        let mut j = i;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= len {
+            // No alias — map table → itself
+            out.entry(short_table.clone())
+                .or_insert(short_table.clone());
+            if full_table != short_table {
+                out.entry(full_table.clone()).or_insert(short_table.clone());
+            }
+            i = j;
+            continue;
+        }
+        // Peek next word
+        let alias_candidate = peek_word(slice, j);
+        if alias_candidate.is_empty() {
+            out.entry(short_table.clone())
+                .or_insert(short_table.clone());
+            i = j;
+            continue;
+        }
+        // If next word is AS, skip it
+        if alias_candidate.eq_ignore_ascii_case("as") {
+            j += alias_candidate.len();
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let second = peek_word(slice, j);
+            if !second.is_empty() && !is_reserved(second.as_str()) {
+                let alias = second.to_ascii_lowercase();
+                out.insert(alias, short_table.clone());
+                out.entry(short_table.clone())
+                    .or_insert(short_table.clone());
+                if full_table != short_table {
+                    out.entry(full_table).or_insert(short_table.clone());
+                }
+                j += second.len();
+                i = j;
+                continue;
+            }
+            // AS without alias
+            out.entry(short_table.clone()).or_insert(short_table);
+            i = j;
+            continue;
+        }
+        if is_reserved(alias_candidate.as_str()) {
+            // No alias, next keyword (WHERE, ON, etc.)
+            out.entry(short_table.clone())
+                .or_insert(short_table.clone());
+            if full_table != short_table {
+                out.entry(full_table).or_insert(short_table);
+            }
+            i = j;
+            continue;
+        }
+        // Treat as alias
+        let alias = alias_candidate.to_ascii_lowercase();
+        out.insert(alias, short_table.clone());
+        out.entry(short_table.clone())
+            .or_insert(short_table.clone());
+        if full_table != short_table {
+            out.entry(full_table).or_insert(short_table.clone());
+        }
+        i = j + alias_candidate.len();
+    }
+    out
+}
+
+/// Resolve alias/table names to `RelationId` via `model`.
+#[must_use]
+pub fn extract_aliases_with_model(
+    sql: &str,
+    cursor: usize,
+    model: &SchemaModel,
+) -> HashMap<String, RelationId> {
+    let map = extract_alias_map(sql, cursor);
+    // Build lookup table name → RelationId (lowercase)
+    let mut table_to_id: HashMap<String, RelationId> = HashMap::new();
+    for rel in model.relations() {
+        table_to_id
+            .entry(rel.name.to_ascii_lowercase())
+            .or_insert(rel.id);
+    }
+    let mut out = HashMap::new();
+    for (alias, table) in map {
+        if let Some(id) = table_to_id.get(&table) {
+            out.insert(alias.clone(), *id);
+            // ensure table itself maps
+            out.entry(table.clone()).or_insert(*id);
+        } else {
+            // fallback: hash
+            let mut hash: u32 = 2166136261;
+            for b in table.as_bytes() {
+                hash ^= u32::from(*b);
+                hash = hash.wrapping_mul(16777619);
+            }
+            let id = pgnative_schema_model::types::Id(hash);
+            out.insert(alias, id);
+        }
+    }
+    out
+}
+
+fn is_word_boundary(s: &str, start: usize, kw_len: usize) -> bool {
+    let bytes = s.as_bytes();
+    let before_ok = start == 0 || !is_ident_char(bytes[start - 1] as char);
+    let after_ok = start + kw_len >= bytes.len() || !is_ident_char(bytes[start + kw_len] as char);
+    before_ok && after_ok
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '"'
+}
+
+fn capture_ident(s: &str, pos: &mut usize) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let start = *pos;
+    // Handle quoted identifier
+    if *pos < len && bytes[*pos] == b'"' {
+        *pos += 1;
+        while *pos < len && bytes[*pos] != b'"' {
+            // handle escaped double quote
+            if bytes[*pos] == b'"' && *pos + 1 < len && bytes[*pos + 1] == b'"' {
+                *pos += 2;
+            } else {
+                *pos += 1;
+            }
+        }
+        if *pos < len && bytes[*pos] == b'"' {
+            *pos += 1;
+        }
+        // May have schema-qualified dot after quoted?
+        // Check for .<ident>
+        if *pos < len && bytes[*pos] == b'.' {
+            // consume dot and next ident
+            *pos += 1;
+            let second = capture_ident(s, pos);
+            // combine
+            let first = &s[start..*pos - second.len() - 1];
+            return format!("{first}.{second}");
+        }
+        return s[start..*pos].to_string();
+    }
+    // Unquoted: read [A-Za-z0-9_]+ possibly with dots for schema.table
+    let mut end = start;
+    while end < len
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+    {
+        // dot handling: ensure dot not trailing
+        end += 1;
+    }
+    // Trim trailing dot if any
+    while end > start && bytes[end - 1] == b'.' {
+        end -= 1;
+    }
+    *pos = end;
+    s[start..end].to_string()
+}
+
+fn peek_word(s: &str, pos: usize) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut end = pos;
+    while end < len
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'"')
+    {
+        if bytes[end] == b'"' {
+            // quoted word
+            end += 1;
+            while end < len && bytes[end] != b'"' {
+                end += 1;
+            }
+            if end < len {
+                end += 1;
+            }
+            break;
+        }
+        end += 1;
+    }
+    s[pos..end].to_string()
+}
+
+fn is_reserved(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "where"
+            | "join"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "full"
+            | "cross"
+            | "on"
+            | "group"
+            | "having"
+            | "order"
+            | "limit"
+            | "offset"
+            | "union"
+            | "select"
+            | "from"
+            | "fetch"
+            | "window"
+            | "values"
+            | "set"
+            | "insert"
+            | "update"
+            | "delete"
+            | "returning"
+            | "with"
+            | "as"
+            | "and"
+            | "or"
+            | "not"
+            | "in"
+            | "is"
+            | "null"
+            | "like"
+            | "ilike"
+            | "between"
+            | "exists"
+            | "case"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "by"
+            | "asc"
+            | "desc"
+    )
 }
 
 /// Hand-curated ~200 common PostgreSQL functions — Product/SQL UX owned, engineering implements.

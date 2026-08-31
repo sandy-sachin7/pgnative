@@ -104,9 +104,9 @@ pub fn update_sql(
 }
 
 /// Same as `update_sql` but with explicit PK values sandwich: SET params first,
-/// then PK params for WHERE. Callers should pass PK values matching PK column
-/// order; if empty, PK placeholders remain but params will be missing (caller
-/// should use this overload to supply them).
+/// then PK params for WHERE. Callers must supply PK values matching PK column
+/// count and order; missing or mismatched PK values are rejected to avoid
+/// half-bound SQL with empty defaults (BUG #3).
 pub fn update_sql_with_pk(
     rel: &Relation,
     diffs: &[ColumnDiff],
@@ -125,6 +125,14 @@ pub fn update_sql_with_pk(
     }
     if diffs.is_empty() {
         return Err(EditError::NoChanges);
+    }
+    // BUG #3 fix: require exact PK value count — no empty defaults.
+    if pk_cols.len() != pk_values.len() {
+        return Err(EditError::NotEditable(format!(
+            "missing PK values: expected {} got {}",
+            pk_cols.len(),
+            pk_values.len()
+        )));
     }
     let set_clause = diffs
         .iter()
@@ -153,16 +161,26 @@ pub fn update_sql_with_pk(
     );
     let mut params: Vec<String> = diffs.iter().map(|d| d.new.clone()).collect();
     // Append PK values in PK column order, looked up from pk_values map.
+    // All PK entries must be present — missing key is an error.
     for cid in &pk_cols {
         let pk_name = rel
             .column_by_id(*cid)
             .map(|c| c.name.as_str())
             .unwrap_or("id");
-        let val = pk_values
+        let Some(val) = pk_values
             .iter()
             .find(|(k, _)| k == pk_name)
             .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+        else {
+            return Err(EditError::NotEditable(format!(
+                "missing PK column '{pk_name}' in pk_values"
+            )));
+        };
+        if val.is_empty() {
+            return Err(EditError::NotEditable(format!(
+                "empty PK value for '{pk_name}'"
+            )));
+        }
         params.push(val);
     }
     Ok((sql, params))
@@ -229,8 +247,29 @@ mod tests {
         let edited = vec![("email".into(), "c@d".into())];
         let diffs = diff_columns(&rel, &orig, &edited).unwrap();
         assert_eq!(diffs.len(), 1);
-        let (sql, _) = update_sql(&rel, &diffs).unwrap();
+        // update_sql without PK must error (BUG #3: no half-bound SQL)
+        assert!(update_sql(&rel, &diffs).is_err());
+        // correct usage with PK values succeeds
+        let pk_values = vec![("id".into(), "1".into())];
+        let (sql, params) = update_sql_with_pk(&rel, &diffs, &pk_values).unwrap();
         assert!(sql.contains("UPDATE"));
         assert!(sql.contains("RETURNING *"));
+        assert_eq!(params.last().unwrap(), "1");
+    }
+
+    #[test]
+    fn update_rejects_missing_pk() {
+        let rel = rel_with_pk();
+        let diffs = vec![ColumnDiff {
+            col: "email".into(),
+            old: "a".into(),
+            new: "b".into(),
+        }];
+        // empty pk_values → error
+        assert!(update_sql_with_pk(&rel, &diffs, &[]).is_err());
+        // wrong column name → error
+        assert!(update_sql_with_pk(&rel, &diffs, &[("wrong".into(), "1".into())]).is_err());
+        // empty value → error
+        assert!(update_sql_with_pk(&rel, &diffs, &[("id".into(), "".into())]).is_err());
     }
 }
