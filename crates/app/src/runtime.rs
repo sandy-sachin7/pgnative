@@ -131,6 +131,55 @@ pub fn spawn_runtime(
                         }
                     }
                 }
+                AppCommand::ConnectDirect { config, password } => {
+                    let ev_tx = event_tx.clone();
+                    match connect_live(&config, password.as_ref()).await {
+                        Ok(sess) => {
+                            let conn_id = sess.id;
+                            {
+                                let mut s = state.write();
+                                s.connections.insert(conn_id, sess.state());
+                            }
+                            let _ = ev_tx.try_send(AppEvent::ConnectionStateChanged {
+                                id: conn_id,
+                                state: "connected".into(),
+                            });
+                            let client_ref = &sess.client;
+                            let _ = pgnative_db_introspection::prepare_session(client_ref).await;
+                            match pgnative_db_introspection::introspect(client_ref).await {
+                                Ok(model) => {
+                                    let arc = Arc::new(model);
+                                    state.write().set_schema((*arc).clone());
+                                    let _ = ev_tx.try_send(AppEvent::SchemaUpdated {
+                                        connection: conn_id,
+                                        model: arc,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx.try_send(AppEvent::Error {
+                                        op: "introspect".into(),
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                            sessions.insert(conn_id, sess);
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.try_send(AppEvent::Error {
+                                op: "connect".into(),
+                                message: e.to_string(),
+                            });
+                            state.write().connections.insert(
+                                config.id,
+                                pgnative_db_connection::ConnectionState::Error {
+                                    id: Some(config.id),
+                                    kind: e.to_string(),
+                                    retryable: true,
+                                },
+                            );
+                        }
+                    }
+                }
                 AppCommand::Disconnect { id } => {
                     if let Some(mut sess) = sessions.remove(&id) {
                         sess.abort_driver();

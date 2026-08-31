@@ -11,6 +11,7 @@ members = [
     "crates/results/export",
     "crates/results/store",
     "crates/results/stream",
+    "crates/results/portal",
     "crates/results/table_browser",
     "crates/results/value",
     "crates/results/viewport",

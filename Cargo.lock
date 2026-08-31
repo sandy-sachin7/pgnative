@@ -3256,6 +3256,7 @@ dependencies = [
  "parking_lot",
  "pgnative-db-connection",
  "pgnative-db-introspection",
+ "pgnative-results-portal",
  "pgnative-results-store",
  "pgnative-results-stream",
  "pgnative-results-value",
@@ -3384,6 +3385,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgnative-results-portal"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures",
+ "pgnative-results-stream",
+ "pgnative-results-value",
+ "postgres-types",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "pgnative-results-store"
 version = "0.1.0"
 dependencies = [
@@ -3403,6 +3422,7 @@ dependencies = [
  "futures",
  "pgnative-results-value",
  "postgres-types",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",

@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
-use pgnative_db_connection::{ConnectionId, ConnectionState, QueryId, TxState};
+use pgnative_db_connection::{ConnectionConfig, ConnectionId, ConnectionState, QueryId, TxState};
 use pgnative_schema_model::SchemaModel;
+use secrecy::SecretString;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,12 @@ use uuid::Uuid;
 pub enum AppCommand {
     Connect {
         id: ConnectionId,
+    },
+    /// Direct connect with explicit config — test + programmatic path that
+    /// bypasses SQLite/keychain (used by integration C gate).
+    ConnectDirect {
+        config: ConnectionConfig,
+        password: Option<SecretString>,
     },
     Disconnect {
         id: ConnectionId,

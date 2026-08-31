@@ -169,24 +169,43 @@ pub fn decode_cell_with_cap(raw: Option<&[u8]>, oid: u32, cap: usize) -> CellVal
         }
         1114 => {
             let s = String::from_utf8_lossy(bytes);
-            // PG timestamp without tz: "2024-01-02 03:04:05" or ISO
+            // PG timestamp without tz: "2024-01-02 03:04:05" (space) or ISO "2024-01-02T03:04:05".
+            // chrono's FromStr expects 'T'; try space form as fallback.
             s.parse::<chrono::NaiveDateTime>()
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
                 .map(CellValue::Timestamp)
                 .unwrap_or_else(|_| CellValue::Text(Bytes::copy_from_slice(bytes)))
         }
         1184 => {
             let s = String::from_utf8_lossy(bytes);
-            // timestamptz — parse as RFC3339 or "YYYY-MM-DD HH:MM:SS+TZ"
+            // timestamptz — PG emits "2024-01-15 12:34:56+00" or RFC3339 "2024-01-15T12:34:56Z".
             if let Ok(dt) = s.parse::<chrono::DateTime<chrono::Utc>>() {
                 CellValue::TimestampTz(dt)
             } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
                 CellValue::TimestampTz(dt.with_timezone(&chrono::Utc))
+            } else if let Ok(dt) = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%z") {
+                CellValue::TimestampTz(dt.with_timezone(&chrono::Utc))
+            } else if let Ok(dt) = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%z") {
+                CellValue::TimestampTz(dt.with_timezone(&chrono::Utc))
+            } else if let Ok(dt) = chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S %z") {
+                CellValue::TimestampTz(dt.with_timezone(&chrono::Utc))
             } else {
-                // Try "2024-01-02 03:04:05+00" form
-                s.parse::<chrono::NaiveDateTime>()
-                    .map(|nd| nd.and_utc())
-                    .map(CellValue::TimestampTz)
-                    .unwrap_or_else(|_| CellValue::Text(Bytes::copy_from_slice(bytes)))
+                // PG shorthand "+00" -> expand to "+0000" for %z
+                let normalized = if s.ends_with("+00") || s.ends_with("-00") {
+                    format!("{s}00")
+                } else {
+                    s.to_string()
+                };
+                if let Ok(dt) = chrono::DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%z")
+                {
+                    CellValue::TimestampTz(dt.with_timezone(&chrono::Utc))
+                } else {
+                    s.parse::<chrono::NaiveDateTime>()
+                        .map(|nd| nd.and_utc())
+                        .map(CellValue::TimestampTz)
+                        .unwrap_or_else(|_| CellValue::Text(Bytes::copy_from_slice(bytes)))
+                }
             }
         }
         114 => CellValue::Json(Bytes::copy_from_slice(bytes)),
@@ -212,6 +231,10 @@ pub fn decode_cell_with_cap(raw: Option<&[u8]>, oid: u32, cap: usize) -> CellVal
         1007 | 1009 | 1016 | 1000 | 1001 | 1005 | 1021 | 1022 | 1231 | 2951 | 199 | 3807 => {
             CellValue::Array(Bytes::copy_from_slice(bytes))
         }
+        // Intentionally textual fallbacks (no dedicated CellValue variant yet):
+        // 1186 interval, 869 inet, 650 cidr, 829 macaddr, 790 money,
+        // 600 point / 628 line / 601 lseg / 603 box / 602 path / 604 polygon / 718 circle,
+        // 1560 bit / 1562 varbit, 142 xml, 2205 regclass etc. — preserved as Text/Other.
         _ => CellValue::Text(Bytes::copy_from_slice(bytes)),
     }
 }
@@ -302,6 +325,20 @@ where
                                 decode_cell_with_cap(raw, *oid, config.per_cell_cap)
                             }
                         },
+                        2950 => match pg_row.try_get::<usize, Option<uuid::Uuid>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Uuid),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes())
+                                    .or_else(|| {
+                                        pg_row.try_get::<usize, Option<&[u8]>>(i).ok().flatten()
+                                    });
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
                         21 => match pg_row.try_get::<usize, Option<i16>>(i) {
                             Ok(v) => v.map_or(CellValue::Null, CellValue::SmallInt),
                             Err(_) => {
@@ -369,6 +406,124 @@ where
                                 decode_cell_with_cap(raw, *oid, config.per_cell_cap)
                             }
                         }
+                        1082 => match pg_row.try_get::<usize, Option<chrono::NaiveDate>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Date),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        1083 => match pg_row.try_get::<usize, Option<chrono::NaiveTime>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Time),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        1114 => match pg_row.try_get::<usize, Option<chrono::NaiveDateTime>>(i) {
+                            Ok(v) => v.map_or(CellValue::Null, CellValue::Timestamp),
+                            Err(_) => {
+                                let raw = pg_row
+                                    .try_get::<usize, Option<&str>>(i)
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.as_bytes());
+                                decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            }
+                        },
+                        1184 => {
+                            // timestamptz — try chrono Utc first (binary), fallback to text decode
+                            if let Ok(Some(dt)) =
+                                pg_row.try_get::<usize, Option<chrono::DateTime<chrono::Utc>>>(i)
+                            {
+                                CellValue::TimestampTz(dt)
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                decode_cell_with_cap(Some(s.as_bytes()), *oid, config.per_cell_cap)
+                            } else {
+                                CellValue::Null
+                            }
+                        }
+                        114 => {
+                            if let Ok(Some(v)) =
+                                pg_row.try_get::<usize, Option<serde_json::Value>>(i)
+                            {
+                                CellValue::Json(Bytes::copy_from_slice(v.to_string().as_bytes()))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                CellValue::Json(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                CellValue::Null
+                            }
+                        }
+                        3802 => {
+                            if let Ok(Some(v)) =
+                                pg_row.try_get::<usize, Option<serde_json::Value>>(i)
+                            {
+                                CellValue::Jsonb(Bytes::copy_from_slice(v.to_string().as_bytes()))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                CellValue::Jsonb(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                CellValue::Null
+                            }
+                        }
+                        18 => {
+                            // \"char\" single byte — try i8 / String fallback
+                            if let Ok(Some(v)) = pg_row.try_get::<usize, Option<i8>>(i) {
+                                CellValue::Text(Bytes::copy_from_slice(&[v as u8]))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<String>>(i) {
+                                CellValue::Text(Bytes::copy_from_slice(s.as_bytes()))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                CellValue::Text(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                CellValue::Null
+                            }
+                        }
+                        1700 => {
+                            if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                decode_cell_with_cap(Some(s.as_bytes()), *oid, config.per_cell_cap)
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<String>>(i) {
+                                decode_cell_with_cap(Some(s.as_bytes()), *oid, config.per_cell_cap)
+                            } else if let Ok(Some(v)) = pg_row.try_get::<usize, Option<f64>>(i) {
+                                // binary numeric may decode as f64
+                                CellValue::Double(v)
+                            } else if let Ok(Some(b)) = pg_row.try_get::<usize, Option<&[u8]>>(i) {
+                                let s = String::from_utf8_lossy(b);
+                                decode_cell_with_cap(Some(s.as_bytes()), *oid, config.per_cell_cap)
+                            } else {
+                                match pg_row.try_get::<usize, Option<&str>>(i) {
+                                    Ok(None) => CellValue::Null,
+                                    _ => CellValue::Null,
+                                }
+                            }
+                        }
+                        1186 | 869 | 650 | 829 | 790 | 600 | 628 | 601 | 603 | 602 | 604 | 718
+                        | 1560 | 1562 | 142 => {
+                            // interval/inet/cidr/etc. — textual fallbacks, try String
+                            if let Ok(Some(s)) = pg_row.try_get::<usize, Option<String>>(i) {
+                                CellValue::Text(Bytes::copy_from_slice(s.as_bytes()))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                CellValue::Text(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                CellValue::Null
+                            }
+                        }
+                        1007 | 1009 | 1016 | 1000 | 1001 | 1005 | 1021 | 1022 | 1231 | 2951
+                        | 199 | 3807 => {
+                            if let Ok(Some(s)) = pg_row.try_get::<usize, Option<String>>(i) {
+                                CellValue::Array(Bytes::copy_from_slice(s.as_bytes()))
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<&str>>(i) {
+                                CellValue::Array(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                CellValue::Null
+                            }
+                        }
                         _ => {
                             let raw = pg_row
                                 .try_get::<usize, Option<&str>>(i)
@@ -378,7 +533,37 @@ where
                                 .or_else(|| {
                                     pg_row.try_get::<usize, Option<&[u8]>>(i).ok().flatten()
                                 });
-                            decode_cell_with_cap(raw, *oid, config.per_cell_cap)
+                            let cv = if let Some(b) = raw {
+                                decode_cell_with_cap(Some(b), *oid, config.per_cell_cap)
+                            } else if let Ok(Some(s)) = pg_row.try_get::<usize, Option<String>>(i) {
+                                // Binary textual types (interval/inet/cidr/arrays) may only
+                                // decode via String when PG sent binary.
+                                CellValue::Text(Bytes::copy_from_slice(s.as_bytes()))
+                            } else {
+                                // Distinguish true SQL NULL (Ok(None)) vs decode error
+                                match pg_row.try_get::<usize, Option<&str>>(i) {
+                                    Ok(None) => CellValue::Null,
+                                    _ => {
+                                        // last resort: try String again for arrays
+                                        if let Ok(Some(s2)) =
+                                            pg_row.try_get::<usize, Option<String>>(i)
+                                        {
+                                            CellValue::Text(Bytes::copy_from_slice(s2.as_bytes()))
+                                        } else {
+                                            CellValue::Null
+                                        }
+                                    }
+                                }
+                            };
+                            // Re-map Text fallbacks for array OIDs to Array variant
+                            match oid {
+                                1007 | 1009 | 1016 | 1000 | 1001 | 1005 | 1021 | 1022 | 1231
+                                | 2951 | 199 | 3807 => match cv {
+                                    CellValue::Text(b) => CellValue::Array(b),
+                                    other => other,
+                                },
+                                _ => cv,
+                            }
                         }
                     };
                     cells.push(cv);
@@ -539,6 +724,168 @@ mod tests {
     fn decode_date() {
         let v = decode_cell(Some(b"2024-01-15"), 1082);
         assert!(matches!(v, CellValue::Date(_)));
+    }
+
+    #[test]
+    fn decode_time() {
+        let v = decode_cell(Some(b"12:34:56"), 1083);
+        assert!(matches!(v, CellValue::Time(_)));
+        // invalid -> Text fallback
+        let v2 = decode_cell(Some(b"not-a-time"), 1083);
+        assert!(matches!(v2, CellValue::Text(_)));
+    }
+
+    #[test]
+    fn decode_timestamp_and_timestamptz() {
+        let v = decode_cell(Some(b"2024-01-15 12:34:56"), 1114);
+        assert!(matches!(v, CellValue::Timestamp(_)));
+        let v2 = decode_cell(Some(b"2024-01-15T12:34:56Z"), 1184);
+        assert!(matches!(v2, CellValue::TimestampTz(_)));
+        let v3 = decode_cell(Some(b"2024-01-15 12:34:56+00"), 1184);
+        assert!(matches!(v3, CellValue::TimestampTz(_)));
+        // invalid ts -> Text fallback
+        let v4 = decode_cell(Some(b"bad-ts"), 1114);
+        assert!(matches!(v4, CellValue::Text(_)));
+    }
+
+    #[test]
+    fn decode_int_variants_and_fallback() {
+        assert!(matches!(
+            decode_cell(Some(b"127"), 21),
+            CellValue::SmallInt(127)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"999999"), 23),
+            CellValue::Int(999999)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"9223372036854775807"), 20),
+            CellValue::BigInt(_)
+        ));
+        // overflow / invalid -> Text
+        assert!(matches!(
+            decode_cell(Some(b"999999999999999999999"), 23),
+            CellValue::Text(_)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"notint"), 21),
+            CellValue::Text(_)
+        ));
+    }
+
+    #[test]
+    fn decode_float_variants() {
+        assert!(matches!(
+            decode_cell(Some(b"3.14"), 700),
+            CellValue::Float(_)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"2.71828"), 701),
+            CellValue::Double(_)
+        ));
+        // "NaN" parses as f64::NAN -> Double (PG may emit 'NaN' for floats)
+        let nan = decode_cell(Some(b"NaN"), 701);
+        assert!(matches!(nan, CellValue::Double(v) if v.is_nan()));
+        // invalid -> Text
+        assert!(matches!(
+            decode_cell(Some(b"not-a-float"), 701),
+            CellValue::Text(_)
+        ));
+    }
+
+    #[test]
+    fn decode_bool_variants() {
+        for (raw, exp) in [
+            (b"t".as_slice(), true),
+            (b"true", true),
+            (b"True", true),
+            (b"TRUE", true),
+            (b"f", false),
+            (b"false", false),
+            (b"FALSE", false),
+        ] {
+            assert_eq!(decode_cell(Some(raw), 16), CellValue::Bool(exp));
+        }
+    }
+
+    #[test]
+    fn decode_bytea_hex() {
+        let v = decode_cell(Some(br"\xdeadbeef"), 17);
+        match v {
+            CellValue::Bytea(b) => assert_eq!(b.as_ref(), &[0xde, 0xad, 0xbe, 0xef]),
+            _ => panic!("expected Bytea"),
+        }
+        // empty hex
+        let v2 = decode_cell(Some(br"\x"), 17);
+        assert!(matches!(v2, CellValue::Bytea(_)));
+    }
+
+    #[test]
+    fn decode_arrays_and_textlikes() {
+        for oid in [25u32, 1043, 1042, 18, 19, 26, 28] {
+            assert!(matches!(
+                decode_cell(Some(b"hello"), oid),
+                CellValue::Text(_)
+            ));
+        }
+        for oid in [
+            1007u32, 1009, 1016, 1000, 1001, 1005, 1021, 1022, 1231, 2951, 199, 3807,
+        ] {
+            assert!(matches!(
+                decode_cell(Some(b"{1,2}"), oid),
+                CellValue::Array(_)
+            ));
+        }
+        // unknown oid -> Text fallback
+        assert!(matches!(
+            decode_cell(Some(b"foo"), 999999),
+            CellValue::Text(_)
+        ));
+        // interval/inet/cidr fallbacks -> Text
+        assert!(matches!(
+            decode_cell(Some(b"1 week"), 1186),
+            CellValue::Text(_)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"127.0.0.1"), 869),
+            CellValue::Text(_)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"192.168.0.0/24"), 650),
+            CellValue::Text(_)
+        ));
+    }
+
+    #[test]
+    fn decode_json_variants() {
+        assert!(matches!(
+            decode_cell(Some(b"null"), 114),
+            CellValue::Json(_)
+        ));
+        assert!(matches!(
+            decode_cell(Some(b"null"), 3802),
+            CellValue::Jsonb(_)
+        ));
+    }
+
+    #[test]
+    fn decode_truncation_utf8_boundary() {
+        // 3-byte utf8 char (e.g. € = e2 82 ac), cap=2 should truncate to 0 and return empty Text (§C8)
+        let euro = "€".as_bytes(); // 3 bytes
+        let mut big = Vec::new();
+        big.extend_from_slice(euro);
+        big.extend(vec![b'a'; 10]);
+        let v = decode_cell_with_cap(Some(&big), 25, 2);
+        match v {
+            CellValue::Text(b) => assert_eq!(b.len(), 0),
+            _ => panic!("expected Text"),
+        }
+        // cap ending on continuation byte truncates safely
+        let v2 = decode_cell_with_cap(Some(&big), 25, 1);
+        match v2 {
+            CellValue::Text(b) => assert_eq!(b.len(), 0),
+            _ => panic!("expected Text"),
+        }
     }
 
     #[test]

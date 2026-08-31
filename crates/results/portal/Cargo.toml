@@ -1,0 +1,19 @@
+[package]
+name = "pgnative-results-portal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pgnative-results-value = { path = "../value" }
+pgnative-results-stream = { path = "../stream" }
+tokio-postgres = { workspace = true }
+postgres-types = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
