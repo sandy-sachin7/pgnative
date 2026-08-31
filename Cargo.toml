@@ -97,15 +97,15 @@ testcontainers = "0.28.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-missing_docs = { level = "warn" }
-unused = "warn"
+missing_docs = { level = "warn", priority = -1 }
+unused = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-perf = "warn"
-style = "warn"
-correctness = "warn"
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
 # Documented exceptions to pedantic. Rationale recorded per rule.
 too_many_lines = "allow"
 module_name_repetitions = "allow"
