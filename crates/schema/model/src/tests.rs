@@ -10,14 +10,14 @@ use crate::types::{
 
 fn sample_model() -> crate::index::SchemaModel {
     let mut b = Builder::new();
-    let s = SchemaId(Id(0));
+    let s = Id(0);
     b.add_schema(Schema {
         id: s,
         name: "public".into(),
         comment: None,
     });
 
-    let rel = RelationId(Id(0));
+    let rel = Id(0);
     b.add_relation(Relation {
         id: rel,
         schema: s,
@@ -26,22 +26,22 @@ fn sample_model() -> crate::index::SchemaModel {
         kind: RelationKind::Table,
         columns: vec![
             Column {
-                id: crate::types::ColumnId(Id(0)),
+                id: crate::types::Id(0),
                 owner: rel,
                 name: "id".into(),
                 position: 1,
-                ty: TypeId(Id(0)),
+                ty: Id(0),
                 nullability: Nullability::NotNull,
                 has_default: false,
                 default_expr: None,
                 value_source: ValueSource::Stored,
             },
             Column {
-                id: crate::types::ColumnId(Id(1)),
+                id: crate::types::Id(1),
                 owner: rel,
                 name: "email".into(),
                 position: 2,
-                ty: TypeId(Id(1)),
+                ty: Id(1),
                 nullability: Nullability::Nullable,
                 has_default: false,
                 default_expr: None,
@@ -57,14 +57,14 @@ fn sample_model() -> crate::index::SchemaModel {
     b.set_primary_key(
         rel,
         PrimaryKey {
-            columns: vec![crate::types::ColumnId(Id(0))],
+            columns: vec![crate::types::Id(0)],
             name: Some("users_pkey".into()),
         },
     );
-    b.add_type(TypeId(Id(0)), "int4".into());
-    b.add_type(TypeId(Id(1)), "varchar".into());
+    b.add_type(Id(0), "int4".into());
+    b.add_type(Id(1), "varchar".into());
     b.add_function(Function {
-        id: crate::types::FunctionId(Id(0)),
+        id: crate::types::Id(0),
         schema: s,
         name: "now".into(),
         signature: "now()".into(),
@@ -84,7 +84,7 @@ fn schema_by_name_round_trips() {
 #[test]
 fn relation_editability_uses_primary_key() {
     let m = sample_model();
-    let rel = m.relations()[0];
+    let rel = m.relations()[0].clone();
     assert_eq!(rel.editability(), Editability::EditableWithPrimaryKey);
 }
 
@@ -92,19 +92,13 @@ fn relation_editability_uses_primary_key() {
 fn relation_lookup_by_oid_and_id() {
     let m = sample_model();
     assert_eq!(m.relation_by_oid(Oid(1)).map(|r| &*r.name), Some("users"));
-    assert_eq!(
-        m.relation(RelationId(Id(0))).map(|r| &*r.name),
-        Some("users")
-    );
+    assert_eq!(m.relation(Id(0)).map(|r| &*r.name), Some("users"));
 }
 
 #[test]
 fn column_owner_resolves() {
     let m = sample_model();
-    assert_eq!(
-        m.owner_of(crate::types::ColumnId(Id(0))),
-        Some(RelationId(Id(0)))
-    );
+    assert_eq!(m.owner_of(crate::types::Id(0)), Some(Id(0)));
 }
 
 #[test]
