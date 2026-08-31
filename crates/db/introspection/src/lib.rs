@@ -77,7 +77,7 @@ pub mod hydrate {
         let mut b = Builder::new();
         // Schemas
         for (oid, name) in schemas {
-            let id = SchemaId(Id(b.schemas_len() as u32));
+            let id = Id(b.schemas_len() as u32);
             b.add_schema(Schema {
                 id,
                 name,
@@ -88,7 +88,7 @@ pub mod hydrate {
         }
         // Relations
         for (oid, ns_oid, name, kind_char) in relations {
-            let schema = SchemaId(Id(0)); // simplified: first schema
+            let schema = Id(0); // simplified: first schema
             let _ = ns_oid;
             let kind = match kind_char {
                 'v' => RelationKind::View,
@@ -96,7 +96,7 @@ pub mod hydrate {
                 'f' => RelationKind::ForeignTable,
                 _ => RelationKind::Table,
             };
-            let id = RelationId(Id(b.relations_len() as u32));
+            let id = Id(b.relations_len() as u32);
             b.add_relation(Relation {
                 id,
                 schema,
@@ -132,11 +132,11 @@ pub mod hydrate {
                 _ => ValueSource::Stored,
             };
             let _col = Column {
-                id: ColumnId(Id(0)),
-                owner: RelationId(Id(0)),
+                id: Id(0),
+                owner: Id(0),
                 name,
                 position: attnum as u16,
-                ty: TypeId(Id(0)),
+                ty: Id(0),
                 nullability: if not_null {
                     Nullability::NotNull
                 } else {
