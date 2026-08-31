@@ -20,5 +20,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+async-trait = { workspace = true }
 pgnative-results-value = { path = "../../results/value" }
 pgnative-db-connection = { path = "../connection" }

@@ -81,6 +81,7 @@ arcstr = "1.2.0"
 # --- Concurrency ---
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
+async-trait = "0.1.88"
 
 # --- Errors / logging ---
 thiserror = "2.0.20"
