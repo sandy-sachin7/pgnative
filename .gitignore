@@ -38,3 +38,4 @@ artifacts/
 
 # Local benchmarks.
 criterion/
+.cargo-home/
