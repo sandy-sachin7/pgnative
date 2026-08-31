@@ -1,0 +1,4 @@
+# Reasonable upper bound on cyclomatic complexity for application code.
+# Individual functions that legitimately need higher complexity are allowed
+# with a `#[expect(clippy::too_many_lines)]`-style local annotation.
+cognitive-complexity-threshold = 30
