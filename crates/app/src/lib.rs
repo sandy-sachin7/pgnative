@@ -125,6 +125,8 @@ impl AppState {
     }
 }
 
+pub mod runtime;
+
 /// Controller — owns channels + optional Tokio JoinSet drain.
 ///
 /// Channels are bounded (256) per §8 back-pressure contract.
@@ -133,7 +135,7 @@ pub struct AppController {
     pub cmd_rx: Receiver<AppCommand>,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Receiver<AppEvent>,
-    pub state: AppState,
+    pub state: Arc<RwLock<AppState>>,
 }
 
 impl AppController {
@@ -146,7 +148,7 @@ impl AppController {
             cmd_rx,
             event_tx,
             event_rx,
-            state: AppState::new(),
+            state: Arc::new(RwLock::new(AppState::new())),
         }
     }
 
@@ -326,6 +328,8 @@ pub struct PgnativeApp {
     pub connection_form: pgnative_ui_connections::ConnectionForm,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
+    completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
+    completion_schema_ptr: Option<*const pgnative_schema_model::SchemaModel>,
 }
 
 impl PgnativeApp {
@@ -345,8 +349,33 @@ impl PgnativeApp {
             }
         }
 
+        let store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>> = Arc::new(
+            parking_lot::RwLock::new(pgnative_results_store::ResultStore::new(
+                pgnative_results_store::StoreConfig::default(),
+            )),
+        );
+        let mut controller = AppController::new();
+        // Spawn single AppRuntime dispatcher if a Tokio handle is available.
+        // eframe itself does not guarantee a Tokio runtime; `try_current` covers
+        // the case where the binary embeds one (production `main` does).
+        // Detached background thread fallback omitted for now — in-process tests
+        // that lack a runtime simply run without the dispatcher.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (_dummy_tx, dummy_rx) = crossbeam_channel::bounded::<AppCommand>(256);
+            let cmd_rx = std::mem::replace(&mut controller.cmd_rx, dummy_rx);
+            let event_tx = controller.event_tx.clone();
+            let state = Arc::clone(&controller.state);
+            let store_clone = Arc::clone(&store);
+            // spawn_runtime already spawns internally via tokio::spawn — call it
+            // and detach the returned JoinHandle onto the current runtime.
+            let rt_handle = crate::runtime::spawn_runtime(cmd_rx, event_tx, store_clone, state);
+            handle.spawn(async move {
+                let _ = rt_handle.await;
+            });
+        }
+
         Self {
-            controller: AppController::new(),
+            controller,
             ui_state,
             viewport: pgnative_results_viewport::ViewportState::default(),
             theme,
@@ -356,11 +385,9 @@ impl PgnativeApp {
             history_query: String::new(),
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
-            store: Arc::new(parking_lot::RwLock::new(
-                pgnative_results_store::ResultStore::new(
-                    pgnative_results_store::StoreConfig::default(),
-                ),
-            )),
+            store,
+            completion_cache: None,
+            completion_schema_ptr: None,
         }
     }
 
@@ -405,8 +432,15 @@ impl eframe::App for PgnativeApp {
                     });
                 }
                 if ui.button("Refresh Schema").clicked() {
-                    // Use first connection if any
-                    if let Some((&id, _)) = self.controller.state.connections.iter().next() {
+                    if let Some(id) = self
+                        .controller
+                        .state
+                        .read()
+                        .connections
+                        .keys()
+                        .next()
+                        .copied()
+                    {
                         self.controller
                             .send_command(AppCommand::RefreshSchema { connection: id });
                     }
@@ -479,23 +513,44 @@ impl eframe::App for PgnativeApp {
                     if resp.changed() {
                         tab.content = content;
                         tab.cursor = tab.content.len();
-                        // Persist editor tab content (best-effort, no blocking toast)
-                        if let Ok(conn) = open_app_db(&app_db_path()) {
-                            let _ = pgnative_storage_editor_state::upsert(
-                                &conn,
-                                &pgnative_storage_editor_state::EditorTab {
-                                    tab_id: tab.id.clone(),
-                                    connection_id: None,
-                                    content: tab.content.clone(),
-                                    cursor: tab.cursor,
-                                    selection: None,
-                                },
-                            );
+                        // Persist off UI thread per §30 — never block render.
+                        let tab_id_clone = tab.id.clone();
+                        let content_clone = tab.content.clone();
+                        let cursor_clone = tab.cursor;
+                        let persist = move || {
+                            if let Ok(conn) = open_app_db(&app_db_path()) {
+                                let _ = pgnative_storage_editor_state::upsert(
+                                    &conn,
+                                    &pgnative_storage_editor_state::EditorTab {
+                                        tab_id: tab_id_clone,
+                                        connection_id: None,
+                                        content: content_clone,
+                                        cursor: cursor_clone,
+                                        selection: None,
+                                    },
+                                );
+                            }
+                        };
+                        if let Ok(h) = tokio::runtime::Handle::try_current() {
+                            h.spawn_blocking(persist);
+                        } else {
+                            std::thread::spawn(persist);
                         }
                     }
-                    // Completion preview (engine built from current schema snapshot)
+                    // Completion preview — cache engine per schema Arc ptr per §30.
                     if let Some(schema) = &self.schema {
-                        let engine = pgnative_schema_completion::CompletionEngine::new(schema);
+                        let ptr = Arc::as_ptr(schema) as *const pgnative_schema_model::SchemaModel;
+                        let engine: Arc<pgnative_schema_completion::CompletionEngine> =
+                            if self.completion_schema_ptr == Some(ptr) {
+                                Arc::clone(self.completion_cache.as_ref().unwrap())
+                            } else {
+                                let e = Arc::new(
+                                    pgnative_schema_completion::CompletionEngine::new(schema),
+                                );
+                                self.completion_cache = Some(Arc::clone(&e));
+                                self.completion_schema_ptr = Some(ptr);
+                                e
+                            };
                         // Prefix = last word before cursor
                         let prefix = tab
                             .content
@@ -512,8 +567,14 @@ impl eframe::App for PgnativeApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Run (Ctrl+Enter)").clicked() {
-                            if let Some((&conn_id, _)) =
-                                self.controller.state.connections.iter().next()
+                            if let Some(conn_id) = self
+                                .controller
+                                .state
+                                .read()
+                                .connections
+                                .keys()
+                                .next()
+                                .copied()
                             {
                                 self.controller.send_command(AppCommand::Execute {
                                     tab: tab.id.clone(),
@@ -524,9 +585,11 @@ impl eframe::App for PgnativeApp {
                         }
                         if ui.button("Cancel (Esc)").clicked() {
                             // Cancel last query if any
-                            if let Some((qid, _)) = self.controller.state.queries.iter().next() {
+                            if let Some(qid) =
+                                self.controller.state.read().queries.keys().next().copied()
+                            {
                                 self.controller
-                                    .send_command(AppCommand::Cancel { query_id: *qid });
+                                    .send_command(AppCommand::Cancel { query_id: qid });
                             }
                         }
                     });

@@ -69,10 +69,12 @@ pub enum IntrospectionError {
 // Client-bound fetch helpers
 // ---------------------------------------------------------------------------
 
-/// Set introspection session parameters (statement_timeout 5s, read-only).
+/// Set introspection session parameters (statement_timeout 5s, default read-only).
+/// Uses `SET default_transaction_read_only` (session-scoped) instead of
+/// `SET TRANSACTION` which is transaction-scoped and invalid outside a txn.
 pub async fn prepare_session(client: &tokio_postgres::Client) -> Result<(), IntrospectionError> {
     client
-        .batch_execute("SET statement_timeout = '5s'; SET TRANSACTION READ ONLY;")
+        .batch_execute("SET statement_timeout = '5s'; SET default_transaction_read_only = on;")
         .await?;
     Ok(())
 }

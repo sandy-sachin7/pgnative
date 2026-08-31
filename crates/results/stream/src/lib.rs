@@ -269,10 +269,17 @@ where
             Ok(pg_row) => {
                 let mut cells = Vec::with_capacity(oids.len());
                 for (i, oid) in oids.iter().enumerate() {
-                    // Text-protocol decode: get Option<&str> then map to bytes.
-                    // This works for all types via PG text format; bytea \x hex is handled in decode.
-                    let raw: Option<&[u8]> =
-                        pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes());
+                    // Text-protocol decode via `Option<&str>` (covers all types in text
+                    // format; bytea arrives as \x hex which decode_cell handles).
+                    // For OID 17 when PG sends binary, fall back to `&[u8]`.
+                    let raw: Option<&[u8]> = if *oid == 17 {
+                        // Try binary bytea first via raw bytes, else text hex.
+                        pg_row
+                            .get::<usize, Option<&[u8]>>(i)
+                            .or_else(|| pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes()))
+                    } else {
+                        pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes())
+                    };
                     let cv = decode_cell_with_cap(raw, *oid, config.per_cell_cap);
                     cells.push(cv);
                 }

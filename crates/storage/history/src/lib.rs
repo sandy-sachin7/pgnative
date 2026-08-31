@@ -50,8 +50,14 @@ pub fn init(conn: &Connection) -> Result<(), HistoryError> {
 }
 
 pub fn insert(conn: &Connection, e: &HistoryEntry) -> Result<(), HistoryError> {
-    let truncated = if e.query_text.len() > 64 * 1024 {
-        &e.query_text[..64 * 1024]
+    const CAP: usize = 64 * 1024;
+    let truncated = if e.query_text.len() > CAP {
+        // UTF-8 safe truncation at char boundary
+        let mut end = CAP;
+        while !e.query_text.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        &e.query_text[..end]
     } else {
         &e.query_text
     };

@@ -498,7 +498,9 @@ pub fn build_pg_config(
     if let Some(pw) = password {
         pg.password(pw.expose_secret());
     }
-    // Keepalive + connect timeout are set at connect time; config is pure.
+    pg.connect_timeout(std::time::Duration::from_secs(10));
+    pg.keepalives(true);
+    pg.keepalives_idle(std::time::Duration::from_secs(30));
     // `application_name` identifies pgNative sessions in `pg_stat_activity`.
     pg.application_name("pgNative");
     // SslMode is handled at the TLS connector layer, not here; we still
@@ -510,27 +512,17 @@ pub fn build_pg_config(
 /// Build a `rustls::ClientConfig` honoring [`SslMode`].
 /// `Disable` is handled by the caller selecting `NoTls`; this function is
 /// only called when TLS is desired. If `root_cert_pem` is provided it is
-/// parsed as PEM and added to the trust anchor store; otherwise an empty
-/// store is used (handshake will fail for self-signed unless the server
-/// presents a system-trusted chain — caller maps to `TlsFailed`).
+/// parsed and added; otherwise `webpki-roots` system trust anchors are loaded
+/// so VerifyFull/VerifyCa/Require validate against the platform bundle.
+/// Prefer without roots still validates when possible but callers should
+/// handle fallback to plaintext at the `connect_live` layer if desired.
 pub fn build_rustls_config(
     ssl_mode: SslMode,
     root_cert_pem: Option<&str>,
 ) -> Result<rustls::ClientConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
-    // If a PEM bundle is supplied, decode it without requiring `rustls-pemfile`
-    // as an extra workspace dep: split on `-----BEGIN CERTIFICATE-----`.
     if let Some(pem) = root_cert_pem {
-        // Best-effort PEM extraction — if parsing fails we surface TlsFailed.
-        // We avoid a hard dep on `rustls-pemfile`; the caller can also pass
-        // `None` and rely on system roots for VerifyFull/VerifyCa.
         let pem_bytes = pem.as_bytes();
-        // Use `rustls::pki_types::CertificateDer` parsing via `pem` crate style:
-        // fallback to trying `rustls`'s built-in PEM loader if available.
-        // For now, attempt to load via `rustls_pemfile` if present, else
-        // treat the PEM as opaque and return an error guiding the caller.
-        // To keep the crate buildable without `rustls-pemfile`, we do a
-        // minimal split and base64-decode attempt using only std.
         let mut added = 0usize;
         for chunk in pem.split("-----BEGIN CERTIFICATE-----") {
             if let Some(end) = chunk.find("-----END CERTIFICATE-----") {
@@ -538,8 +530,6 @@ pub fn build_rustls_config(
                     .chars()
                     .filter(|c| !c.is_whitespace())
                     .collect::<String>();
-                // Decode base64 via `rustls` helper if possible; otherwise skip.
-                // We use a tiny inline base64 decoder to avoid new deps.
                 if let Some(der) = decode_base64(&b64) {
                     let cert = rustls::pki_types::CertificateDer::from(der);
                     if roots.add(cert).is_ok() {
@@ -549,10 +539,11 @@ pub fn build_rustls_config(
             }
         }
         if added == 0 && !pem_bytes.is_empty() {
-            // No cert added — treat as invalid PEM.
             return Err("invalid PEM: no certificates found".to_string());
         }
-        let _ = added;
+    } else {
+        // No explicit PEM — load Mozilla roots via webpki-roots for system trust.
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
     let builder = rustls::ClientConfig::builder();
@@ -632,7 +623,7 @@ pub fn map_connect_error(err: tokio_postgres::Error, sanitized_url: String) -> C
 /// `ReadyForQuery` state byte authoritatively.
 pub struct LiveSession {
     pub id: ConnectionId,
-    pub client: tokio_postgres::Client,
+    pub client: std::sync::Arc<tokio_postgres::Client>,
     pub cancel_token: tokio_postgres::CancelToken,
     pub health: SessionHealth,
     pub tx: TxState,
@@ -717,7 +708,7 @@ pub async fn connect_live(
     // startup; we default to Idle/Ready and let query execution correct it.
     Ok(LiveSession {
         id: cfg.id,
-        client,
+        client: std::sync::Arc::new(client),
         cancel_token,
         health: SessionHealth::Ready,
         tx: TxState::Idle,
