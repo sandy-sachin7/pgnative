@@ -51,7 +51,8 @@ pub fn export_json(rows: &[Row]) -> Result<String, ExportError> {
                 CellValue::Bool(b) => b.to_string(),
                 CellValue::Int(v) => v.to_string(),
                 CellValue::BigInt(v) => v.to_string(),
-                _ => format!("\"{}\"", c.to_display_string().replace('"', "\\\"")),
+                _ => serde_json::to_string(&c.to_display_string())
+                    .unwrap_or_else(|_| "\"\"".to_string()),
             })
             .collect();
         out.push('[');

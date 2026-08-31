@@ -2705,16 +2705,21 @@ name = "pgnative-db-cancellation"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "rustls",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
 name = "pgnative-db-connection"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rustls",
  "secrecy",
  "thiserror 2.0.20",

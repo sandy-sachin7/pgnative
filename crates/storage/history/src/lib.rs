@@ -51,7 +51,7 @@ pub fn init(conn: &Connection) -> Result<(), HistoryError> {
 
 /// Redact history text that likely contains secrets per §35.
 /// Heuristic: if lowercased query contains password|passwd|pwd|secret|token
-/// store a placeholder instead of verbatim literals.
+/// or api_key|apikey|private_key|aws_secret|client_secret store a placeholder.
 #[must_use]
 pub fn sanitize_for_history(sql: &str) -> String {
     let low = sql.to_ascii_lowercase();
@@ -60,6 +60,11 @@ pub fn sanitize_for_history(sql: &str) -> String {
         || low.contains("secret")
         || low.contains("token")
         || low.contains("pwd")
+        || low.contains("api_key")
+        || low.contains("apikey")
+        || low.contains("private_key")
+        || low.contains("aws_secret")
+        || low.contains("client_secret")
     {
         return "[REDACTED sensitive query]".to_string();
     }

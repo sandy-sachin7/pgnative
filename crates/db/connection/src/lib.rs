@@ -192,11 +192,13 @@ pub fn sanitize_url(raw: &str) -> String {
         }
         return url.to_string();
     }
-    // Fallback: replace sensitive key=... substrings (case-insensitive)
+    // Fallback: replace sensitive key=... substrings (case-insensitive).
+    // Loop per key to handle multiple occurrences (e.g. query string with repeated password params).
     let mut out = raw.to_string();
     for key in ["password=", "passwd=", "pwd=", "secret=", "token="] {
-        let low = out.to_ascii_lowercase();
-        if let Some(idx) = low.find(key) {
+        loop {
+            let low = out.to_ascii_lowercase();
+            let Some(idx) = low.find(key) else { break };
             let start = idx + key.len();
             if let Some(end) = out[start..].find(['&', ' ']) {
                 out.replace_range(start..start + end, "***");
@@ -552,6 +554,15 @@ pub fn build_rustls_config(
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
+    // TLS mode distinction documented:
+    // - VerifyFull: validates chain + hostname (rustls does hostname verification via ServerName).
+    // - VerifyCa: validates chain via roots; hostname check is still performed by rustls
+    //   when a ServerName is supplied — caller must ensure ServerName handling matches intent.
+    // - Require/Prefer: currently also validate against webpki roots (strict) and do NOT
+    //   silently accept insecure; Prefer does not downgrade to plaintext here — plaintext
+    //   is only via SslMode::Disable/NoTls. This avoids collapsing modes into insecure.
+    // All modes (except Disable) load webpki roots if no explicit PEM is given, so we never
+    // silently accept without trust anchors.
     let builder = rustls::ClientConfig::builder();
     let config = match ssl_mode {
         SslMode::VerifyFull | SslMode::VerifyCa | SslMode::Require | SslMode::Prefer => {
@@ -563,23 +574,10 @@ pub fn build_rustls_config(
 }
 
 fn decode_base64(s: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let mut buf: u32 = 0;
-    let mut bits: u8 = 0;
-    for &b in s.as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let val = TABLE.iter().position(|&x| x == b)? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
-        }
-    }
-    Some(out)
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .ok()
 }
 
 /// Classify a `tokio_postgres::Error` into [`ConnectionErrorKind`] using the
@@ -673,16 +671,24 @@ impl LiveSession {
     /// `Disable` uses `NoTls`; all other modes use `MakeRustlsConnect` built from
     /// the same `SslMode`/`ssl_root_cert` used at connect time — avoids leaking
     /// `pid/secret` in plaintext and failing on `hostssl` servers (§26).
-    pub async fn cancel_query_via_tls(&self) -> Result<(), tokio_postgres::Error> {
+    /// On TLS config error we return Err(String) (do NOT fallback to NoTls) and let
+    /// the caller poison the session — plaintext fallback would leak cancel secrets (C1).
+    pub async fn cancel_query_via_tls(&self) -> Result<(), String> {
         match self.ssl_mode {
-            SslMode::Disable => self.cancel_token.cancel_query(tokio_postgres::NoTls).await,
-            _ => match build_rustls_config(self.ssl_mode, self.ssl_root_cert.as_deref()) {
-                Ok(rustls_cfg) => {
-                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_cfg);
-                    self.cancel_token.cancel_query(tls).await
-                }
-                Err(_) => self.cancel_token.cancel_query(tokio_postgres::NoTls).await,
-            },
+            SslMode::Disable => self
+                .cancel_token
+                .cancel_query(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| e.to_string()),
+            _ => {
+                let rustls_cfg = build_rustls_config(self.ssl_mode, self.ssl_root_cert.as_deref())
+                    .map_err(|e| format!("TLS config for cancel failed: {e}"))?;
+                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_cfg);
+                self.cancel_token
+                    .cancel_query(tls)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 }

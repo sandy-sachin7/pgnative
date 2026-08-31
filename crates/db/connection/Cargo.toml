@@ -23,3 +23,4 @@ secrecy = { workspace = true }
 zeroize = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+base64 = "0.22"
