@@ -401,11 +401,13 @@ pub fn spawn_runtime(
                         if let Ok(conn) = crate::open_app_db(&crate::app_db_path()) {
                             let res =
                                 pgnative_storage_history::search(&conn, &query).unwrap_or_default();
-                            let joined = res
-                                .into_iter()
-                                .map(|e| e.query_text)
-                                .collect::<Vec<_>>()
-                                .join("\n---\n");
+                            let results = res.into_iter().map(|e| e.query_text).collect::<Vec<_>>();
+                            // Prefer typed HistoryResults; keep Error fallback for old listeners
+                            let _ = ev_tx.try_send(AppEvent::HistoryResults {
+                                results: results.clone(),
+                            });
+                            // Back-compat fallback (removed once all listeners handle HistoryResults)
+                            let joined = results.join("\n---\n");
                             let _ = ev_tx.try_send(AppEvent::Error {
                                 op: "history".into(),
                                 message: joined,

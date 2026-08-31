@@ -91,6 +91,9 @@ pub enum AppEvent {
     PreferencesRestored {
         ui_state: pgnative_ui_layout::UiState,
     },
+    HistoryResults {
+        results: Vec<String>,
+    },
 }
 
 /// Domain state — AppState (§54), separate from UiState.
@@ -452,7 +455,18 @@ impl PgnativeApp {
                     tracing::info!(state = %state, "connection state");
                 }
                 AppEvent::Error { op, message } => {
-                    tracing::warn!(op = %op, message = %message, "app error");
+                    // Back-compat: history search still emits Error{op:"history"} until
+                    // runtime migrates to HistoryResults (small append, no break).
+                    if op == "history" {
+                        if message.is_empty() {
+                            self.history_results.clear();
+                        } else {
+                            self.history_results =
+                                message.split("\n---\n").map(|s| s.to_string()).collect();
+                        }
+                    } else {
+                        tracing::warn!(op = %op, message = %message, "app error");
+                    }
                 }
                 AppEvent::DisconnectRequiresDecision { id } => {
                     tracing::warn!(%id, "disconnect requires decision — active tx");
@@ -460,9 +474,94 @@ impl PgnativeApp {
                 AppEvent::PreferencesRestored { ui_state } => {
                     self.ui_state = ui_state;
                 }
+                AppEvent::HistoryResults { results } => {
+                    self.history_results = results;
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Shortcuts: Ctrl+Enter execute, Esc cancel, F5 refresh (§32).
+    /// Must be called from `ui()` after `ctx` is cloned; uses `ctx.input`.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+Enter → execute active tab
+        let exec = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+        if exec {
+            if let Some(tab_id) = self.active_tab.clone() {
+                if let Some(tab) = self.editor_tabs.get(&tab_id) {
+                    if let Some(conn_id) = self
+                        .controller
+                        .state
+                        .read()
+                        .connections
+                        .keys()
+                        .next()
+                        .copied()
+                    {
+                        self.controller.send_command(AppCommand::Execute {
+                            tab: tab.id.clone(),
+                            sql: tab.content.clone(),
+                            connection: conn_id,
+                        });
+                    }
+                }
+            }
+        }
+        // Esc → cancel last query
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                self.controller
+                    .send_command(AppCommand::Cancel { query_id: qid });
+            }
+        }
+        // F5 → refresh schema
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            if let Some(conn_id) = self
+                .controller
+                .state
+                .read()
+                .connections
+                .keys()
+                .next()
+                .copied()
+            {
+                self.controller.send_command(AppCommand::RefreshSchema {
+                    connection: conn_id,
+                });
+            }
+        }
+    }
+
+    fn tx_badge_text(&self) -> Option<(String, egui::Color32)> {
+        // Derive from canonical ConnectionState::tx() plus AppState::tx fallback.
+        let state = self.controller.state.read();
+        for cs in state.connections.values() {
+            if let Some(tx) = cs.tx_state() {
+                match tx {
+                    TxState::Idle => {}
+                    TxState::InTransaction { .. } => {
+                        return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
+                    }
+                    TxState::InFailedTransaction => {
+                        return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
+                    }
+                }
+            }
+        }
+        // Fallback to explicit tx map (covers optimistic classify_tx before ReadyForQuery)
+        for tx in state.tx.values() {
+            match tx {
+                TxState::InTransaction { .. } => {
+                    return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
+                }
+                TxState::InFailedTransaction => {
+                    return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
+                }
+                TxState::Idle => {}
+            }
+        }
+        None
     }
 }
 
@@ -471,11 +570,27 @@ impl eframe::App for PgnativeApp {
         // Poll controller events (non-blocking) before render
         self.poll_events();
         let ctx = ui.ctx().clone();
+        // Keyboard shortcuts (§32): Ctrl+Enter execute, Esc cancel, F5 refresh
+        self.handle_shortcuts(&ctx);
 
-        // Top bar: connection + theme toggle
+        // Top bar: connection + Tx badge + theme toggle
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("pgNative");
+                ui.label(egui::RichText::new("pgNative").strong());
+                // Tx badge (§22) — visible when any connection is in transaction
+                if let Some((label, color)) = self.tx_badge_text() {
+                    let badge = egui::RichText::new(label)
+                        .color(egui::Color32::WHITE)
+                        .small()
+                        .strong();
+                    egui::Frame::new()
+                        .fill(color)
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.label(badge);
+                        });
+                }
                 if ui.button("New Tab").clicked() {
                     let id = format!("tab-{}", self.editor_tabs.len() + 1);
                     self.editor_tabs
@@ -677,6 +792,34 @@ impl eframe::App for PgnativeApp {
                 snap.rows.len(),
                 snap.state
             ));
+            // Export wiring placeholder (§28) — streams via runtime Export command
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Export:").weak().small());
+                if ui.small_button("CSV").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::Csv,
+                        });
+                    }
+                }
+                if ui.small_button("JSON").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::Json,
+                        });
+                    }
+                }
+                if ui.small_button("SQL").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::SqlInsert,
+                        });
+                    }
+                }
+            });
         });
 
         // Connections panel at bottom (collapsible)
