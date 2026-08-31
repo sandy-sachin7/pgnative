@@ -13,24 +13,24 @@ use crate::types::{ColumnId, FunctionId, Oid, RelationId, RelationKind, SchemaId
 /// block. See `ADR-0007`.
 #[derive(Debug, Default, Clone)]
 pub struct SchemaModel {
-    schemas: Vec<Schema>,
-    relations: Vec<Relation>,
-    functions: Vec<Function>,
+    pub(crate) schemas: Vec<Schema>,
+    pub(crate) relations: Vec<Relation>,
+    pub(crate) functions: Vec<Function>,
     /// Raw type names keyed by type id. Types are few and rarely inspected in
     /// detail, so a flat map is sufficient.
-    types: HashMap<TypeId, String>,
+    pub(crate) types: HashMap<TypeId, String>,
 
     // --- indexes -----------------------------------------------------------
-    schema_by_name: HashMap<String, SchemaId>,
-    relation_by_oid: HashMap<Oid, RelationId>,
+    pub(crate) schema_by_name: HashMap<String, SchemaId>,
+    pub(crate) relation_by_oid: HashMap<Oid, RelationId>,
     /// Relations grouped by schema, in schema + name order.
-    relations_by_schema: HashMap<SchemaId, Vec<RelationId>>,
+    pub(crate) relations_by_schema: HashMap<SchemaId, Vec<RelationId>>,
     /// Function ids grouped by schema.
-    functions_by_schema: HashMap<SchemaId, Vec<FunctionId>>,
+    pub(crate) functions_by_schema: HashMap<SchemaId, Vec<FunctionId>>,
     /// Relation ids sorted by (schema, name) for deterministic iteration.
-    sorted_relations: Vec<RelationId>,
+    pub(crate) sorted_relations: Vec<RelationId>,
     /// First column of each relation, to support editing joins cheaply.
-    column_owner: HashMap<ColumnId, RelationId>,
+    pub(crate) column_owner: HashMap<ColumnId, RelationId>,
 }
 
 impl SchemaModel {
