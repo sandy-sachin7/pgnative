@@ -22,9 +22,10 @@ impl Builder {
     pub fn add_schema(&mut self, schema: Schema) -> SchemaId {
         let id = schema.id;
         self.model.schemas.push(schema);
-        self.model
-            .schema_by_name
-            .insert(self.model.schemas.last().unwrap().name.clone(), id);
+        self.model.schema_by_name.insert(
+            self.model.schemas.last().expect("just pushed").name.clone(),
+            id,
+        );
         id
     }
 
@@ -32,7 +33,7 @@ impl Builder {
     pub fn add_relation(&mut self, relation: Relation) -> RelationId {
         let id = relation.id;
         self.model.relations.push(relation);
-        let rt = self.model.relations.last().unwrap();
+        let rt = self.model.relations.last().expect("just pushed");
         self.model.sorted_relations.push(id);
         self.model.relation_by_oid.insert(rt.oid, id);
         self.model
@@ -50,7 +51,7 @@ impl Builder {
     pub fn add_function(&mut self, function: Function) -> FunctionId {
         let id = function.id;
         self.model.functions.push(function);
-        let f = self.model.functions.last().unwrap();
+        let f = self.model.functions.last().expect("just pushed");
         self.model
             .functions_by_schema
             .entry(f.schema)

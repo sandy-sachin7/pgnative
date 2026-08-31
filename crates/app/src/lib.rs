@@ -88,6 +88,9 @@ pub enum AppEvent {
     DisconnectRequiresDecision {
         id: ConnectionId,
     },
+    PreferencesRestored {
+        ui_state: pgnative_ui_layout::UiState,
+    },
 }
 
 /// Domain state — AppState (§54), separate from UiState.
@@ -337,6 +340,8 @@ pub struct PgnativeApp {
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
     completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
     completion_schema_ptr: Option<*const pgnative_schema_model::SchemaModel>,
+    runtime_handle: Option<tokio::task::JoinHandle<()>>,
+    last_editor_persist: std::time::Instant,
 }
 
 impl PgnativeApp {
@@ -346,15 +351,8 @@ impl PgnativeApp {
         let theme = pgnative_ui_theme::Theme::dark();
         cc.egui_ctx.set_visuals(theme.visuals());
 
-        // Restore UI state from SQLite preferences if present
-        let mut ui_state = pgnative_ui_layout::UiState::default();
-        if let Ok(conn) = open_app_db(&app_db_path()) {
-            if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
-                if let Ok(restored) = serde_json::from_value::<pgnative_ui_layout::UiState>(v) {
-                    ui_state = restored;
-                }
-            }
-        }
+        // Restore UI state: default immediately; load persisted state off UI thread.
+        let ui_state = pgnative_ui_layout::UiState::default();
 
         let store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>> = Arc::new(
             parking_lot::RwLock::new(pgnative_results_store::ResultStore::new(
@@ -362,22 +360,33 @@ impl PgnativeApp {
             )),
         );
         let mut controller = AppController::new();
+        let mut runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
         // Spawn single AppRuntime dispatcher if a Tokio handle is available.
-        // eframe itself does not guarantee a Tokio runtime; `try_current` covers
-        // the case where the binary embeds one (production `main` does).
-        // Detached background thread fallback omitted for now — in-process tests
-        // that lack a runtime simply run without the dispatcher.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let (_dummy_tx, dummy_rx) = crossbeam_channel::bounded::<AppCommand>(256);
             let cmd_rx = std::mem::replace(&mut controller.cmd_rx, dummy_rx);
             let event_tx = controller.event_tx.clone();
             let state = Arc::clone(&controller.state);
             let store_clone = Arc::clone(&store);
-            // spawn_runtime already spawns internally via tokio::spawn — call it
-            // and detach the returned JoinHandle onto the current runtime.
-            let rt_handle = crate::runtime::spawn_runtime(cmd_rx, event_tx, store_clone, state);
-            handle.spawn(async move {
+            let rt_handle =
+                crate::runtime::spawn_runtime(cmd_rx, event_tx.clone(), store_clone, state);
+            // Keep handle so Drop can abort; also forward completion
+            runtime_handle = Some(handle.spawn(async move {
                 let _ = rt_handle.await;
+            }));
+            // Load persisted UI state off the render thread (§30)
+            let ev_tx = event_tx;
+            handle.spawn_blocking(move || {
+                if let Ok(conn) = open_app_db(&app_db_path()) {
+                    if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
+                        if let Ok(restored) =
+                            serde_json::from_value::<pgnative_ui_layout::UiState>(v)
+                        {
+                            let _ = ev_tx
+                                .try_send(AppEvent::PreferencesRestored { ui_state: restored });
+                        }
+                    }
+                }
             });
         }
 
@@ -395,6 +404,8 @@ impl PgnativeApp {
             store,
             completion_cache: None,
             completion_schema_ptr: None,
+            runtime_handle,
+            last_editor_persist: std::time::Instant::now() - std::time::Duration::from_secs(1),
         }
     }
 
@@ -412,6 +423,9 @@ impl PgnativeApp {
                 }
                 AppEvent::DisconnectRequiresDecision { id } => {
                     tracing::warn!(%id, "disconnect requires decision — active tx");
+                }
+                AppEvent::PreferencesRestored { ui_state } => {
+                    self.ui_state = ui_state;
                 }
                 _ => {}
             }
@@ -520,28 +534,33 @@ impl eframe::App for PgnativeApp {
                     if resp.changed() {
                         tab.content = content;
                         tab.cursor = tab.content.len();
-                        // Persist off UI thread per §30 — never block render.
-                        let tab_id_clone = tab.id.clone();
-                        let content_clone = tab.content.clone();
-                        let cursor_clone = tab.cursor;
-                        let persist = move || {
-                            if let Ok(conn) = open_app_db(&app_db_path()) {
-                                let _ = pgnative_storage_editor_state::upsert(
-                                    &conn,
-                                    &pgnative_storage_editor_state::EditorTab {
-                                        tab_id: tab_id_clone,
-                                        connection_id: None,
-                                        content: content_clone,
-                                        cursor: cursor_clone,
-                                        selection: None,
-                                    },
-                                );
+                        // Persist off UI thread per §30 — debounced to avoid per-keystroke thread explosion.
+                        let now = std::time::Instant::now();
+                        let debounce = std::time::Duration::from_millis(350);
+                        if now.duration_since(self.last_editor_persist) >= debounce {
+                            self.last_editor_persist = now;
+                            let tab_id_clone = tab.id.clone();
+                            let content_clone = tab.content.clone();
+                            let cursor_clone = tab.cursor;
+                            let persist = move || {
+                                if let Ok(conn) = open_app_db(&app_db_path()) {
+                                    let _ = pgnative_storage_editor_state::upsert(
+                                        &conn,
+                                        &pgnative_storage_editor_state::EditorTab {
+                                            tab_id: tab_id_clone,
+                                            connection_id: None,
+                                            content: content_clone,
+                                            cursor: cursor_clone,
+                                            selection: None,
+                                        },
+                                    );
+                                }
+                            };
+                            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                                h.spawn_blocking(persist);
+                            } else {
+                                std::thread::spawn(persist);
                             }
-                        };
-                        if let Ok(h) = tokio::runtime::Handle::try_current() {
-                            h.spawn_blocking(persist);
-                        } else {
-                            std::thread::spawn(persist);
                         }
                     }
                     // Completion preview — cache engine per schema Arc ptr per §30.
@@ -642,6 +661,14 @@ impl eframe::App for PgnativeApp {
 
         // Repaint when streaming results
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+impl Drop for PgnativeApp {
+    fn drop(&mut self) {
+        if let Some(h) = self.runtime_handle.take() {
+            h.abort();
+        }
     }
 }
 

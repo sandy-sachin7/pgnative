@@ -30,16 +30,21 @@ pub fn spawn_runtime(
         let queries: Arc<parking_lot::Mutex<HashMap<QueryId, QueryEntry>>> =
             Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
-        loop {
-            let cmd = {
-                let rx = cmd_rx.clone();
-                match tokio::task::spawn_blocking(move || rx.recv()).await {
-                    Ok(Ok(c)) => Some(c),
-                    Ok(Err(_)) => break, // channel disconnected
-                    Err(_) => break,
+        // Bridge crossbeam (sync, UI thread) -> tokio mpsc with a single blocking thread
+        // instead of per-command spawn_blocking churn (§8).
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<AppCommand>(256);
+        // Single dedicated thread forwards commands; exits when crossbeam disconnects
+        // or bridge is closed (runtime shutdown).
+        let bridge_handle = tokio::task::spawn_blocking(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                if bridge_tx.blocking_send(cmd).is_err() {
+                    break;
                 }
-            };
-            let Some(cmd) = cmd else {
+            }
+        });
+
+        loop {
+            let Some(cmd) = bridge_rx.recv().await else {
                 break;
             };
 
@@ -303,9 +308,9 @@ pub fn spawn_runtime(
                 AppCommand::Cancel { query_id } => {
                     let entry_opt = { queries.lock().remove(&query_id) };
                     if let Some(entry) = entry_opt {
-                        match entry.ssl_mode {
+                        let cancel_res: Result<(), tokio_postgres::Error> = match entry.ssl_mode {
                             SslMode::Disable => {
-                                let _ = entry.cancel.cancel_query(tokio_postgres::NoTls).await;
+                                entry.cancel.cancel_query(tokio_postgres::NoTls).await
                             }
                             _ => {
                                 if let Ok(cfg) = pgnative_db_connection::build_rustls_config(
@@ -313,10 +318,19 @@ pub fn spawn_runtime(
                                     entry.ssl_root_cert.as_deref(),
                                 ) {
                                     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(cfg);
-                                    let _ = entry.cancel.cancel_query(tls).await;
+                                    entry.cancel.cancel_query(tls).await
                                 } else {
-                                    let _ = entry.cancel.cancel_query(tokio_postgres::NoTls).await;
+                                    entry.cancel.cancel_query(tokio_postgres::NoTls).await
                                 }
+                            }
+                        };
+                        if cancel_res.is_err() {
+                            if let Some(sess) = sessions.get_mut(&entry.connection) {
+                                sess.health = pgnative_db_connection::SessionHealth::Poisoned;
+                                tracing::warn!(
+                                    connection = %entry.connection,
+                                    "cancel failed — marking session Poisoned (needs reconnect)"
+                                );
                             }
                         }
                         entry.handle.abort();
@@ -377,6 +391,8 @@ pub fn spawn_runtime(
                 }
             }
         }
+        // Ensure bridge thread exits on shutdown
+        bridge_handle.abort();
     })
 }
 
