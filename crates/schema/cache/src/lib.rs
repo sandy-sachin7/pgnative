@@ -1,0 +1,1 @@
+//! ArcSwap-based SchemaModel cache.

@@ -4,9 +4,7 @@ use std::collections::HashMap;
 
 use crate::relation::{Function, Relation};
 use crate::schema::Schema;
-use crate::types::{
-    ColumnId, FunctionId, Oid, RelationId, RelationKind, SchemaId, TypeId,
-};
+use crate::types::{ColumnId, FunctionId, Oid, RelationId, RelationKind, SchemaId, TypeId};
 
 /// The canonical in-memory schema model for a single database connection.
 ///
@@ -63,7 +61,9 @@ impl SchemaModel {
     /// Look up a schema by name.
     #[must_use]
     pub fn schema_named(&self, name: &str) -> Option<&Schema> {
-        self.schema_by_name.get(name).map(|&id| &self.schemas[id.0 as usize])
+        self.schema_by_name
+            .get(name)
+            .map(|&id| &self.schemas[id.0 as usize])
     }
 
     /// Look up a relation by its local id.
@@ -75,7 +75,9 @@ impl SchemaModel {
     /// Look up a relation by server OID.
     #[must_use]
     pub fn relation_by_oid(&self, oid: Oid) -> Option<&Relation> {
-        self.relation_by_oid.get(&oid).and_then(|&id| self.relation(id))
+        self.relation_by_oid
+            .get(&oid)
+            .and_then(|&id| self.relation(id))
     }
 
     /// Look up a function by its local id.
@@ -87,7 +89,9 @@ impl SchemaModel {
     /// Relations belonging to a schema, ordered by (schema, name).
     #[must_use]
     pub fn relations_in(&self, schema: SchemaId) -> &[RelationId] {
-        self.relations_by_schema.get(&schema).map_or(&[], Vec::as_slice)
+        self.relations_by_schema
+            .get(&schema)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Functions belonging to a schema.

@@ -1,0 +1,1 @@
+//! PG row stream → CellValue.

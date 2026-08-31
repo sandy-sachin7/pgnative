@@ -51,7 +51,11 @@ impl Builder {
         let id = function.id;
         self.model.functions.push(function);
         let f = self.model.functions.last().unwrap();
-        self.model.functions_by_schema.entry(f.schema).or_default().push(id);
+        self.model
+            .functions_by_schema
+            .entry(f.schema)
+            .or_default()
+            .push(id);
         id
     }
 

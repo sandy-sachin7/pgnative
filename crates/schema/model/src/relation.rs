@@ -80,9 +80,11 @@ impl UniqueKey {
     /// row identity candidate.
     #[must_use]
     pub fn is_not_nullable(&self, relation: &Relation) -> bool {
-        self.columns
-            .iter()
-            .all(|cid| relation.column_by_id(*cid).is_some_and(|c| c.nullability == crate::types::Nullability::NotNull))
+        self.columns.iter().all(|cid| {
+            relation
+                .column_by_id(*cid)
+                .is_some_and(|c| c.nullability == crate::types::Nullability::NotNull)
+        })
     }
 }
 

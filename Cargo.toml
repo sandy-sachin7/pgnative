@@ -2,10 +2,34 @@
 resolver = "2"
 members = [
     "crates/app",
+    "crates/db/cancellation",
     "crates/db/connection",
     "crates/db/execution",
+    "crates/db/introspection",
+    "crates/observability",
+    "crates/results/edit",
+    "crates/results/export",
+    "crates/results/store",
+    "crates/results/stream",
+    "crates/results/table_browser",
     "crates/results/value",
+    "crates/results/viewport",
+    "crates/schema/cache",
+    "crates/schema/completion",
     "crates/schema/model",
+    "crates/storage/connections",
+    "crates/storage/editor_state",
+    "crates/storage/history",
+    "crates/storage/keychain",
+    "crates/storage/preferences",
+    "crates/ui/connections",
+    "crates/ui/editor",
+    "crates/ui/explorer",
+    "crates/ui/history_panel",
+    "crates/ui/layout",
+    "crates/ui/results",
+    "crates/ui/shortcuts",
+    "crates/ui/theme",
     "xtask",
 ]
 
@@ -40,7 +64,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 directories = "6.0.0"
 
 # --- Credentials / security ---
-keyring = { version = "4.2.0", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+keyring = { version = "4.2.0" }
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 url = "2.5.8"
@@ -55,7 +79,7 @@ bytes = "1.12.1"
 arcstr = "1.2.0"
 
 # --- Concurrency ---
-crossbeam-channel = "0.5.16"
+crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
 
 # --- Errors / logging ---

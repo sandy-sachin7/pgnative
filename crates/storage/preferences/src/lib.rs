@@ -1,0 +1,1 @@
+//! Preferences (JSON in SQLite).

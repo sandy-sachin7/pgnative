@@ -80,8 +80,12 @@ impl CellValue {
             Self::Float(v) => v.to_string(),
             Self::Double(v) => v.to_string(),
             Self::Numeric(v) => v.to_string(),
-            Self::Text(b) | Self::Json(b) | Self::Jsonb(b) | Self::Array(b)
-            | Self::Enum(b) | Self::Other(b) => String::from_utf8_lossy(b).into_owned(),
+            Self::Text(b)
+            | Self::Json(b)
+            | Self::Jsonb(b)
+            | Self::Array(b)
+            | Self::Enum(b)
+            | Self::Other(b) => String::from_utf8_lossy(b).into_owned(),
             Self::Bytea(b) => hex_encode(b),
             Self::Date(d) => d.to_string(),
             Self::Time(t) => t.to_string(),
@@ -96,8 +100,13 @@ impl CellValue {
     pub const fn is_textual(&self) -> bool {
         matches!(
             self,
-            Self::Text(_) | Self::Json(_) | Self::Jsonb(_) | Self::Array(_) | Self::Enum(_)
-                | Self::Other(_) | Self::Bytea(_)
+            Self::Text(_)
+                | Self::Json(_)
+                | Self::Jsonb(_)
+                | Self::Array(_)
+                | Self::Enum(_)
+                | Self::Other(_)
+                | Self::Bytea(_)
         )
     }
 }

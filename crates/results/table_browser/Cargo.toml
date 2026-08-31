@@ -1,0 +1,18 @@
+[package]
+name = "pgnative-results-table-browser"
+description = "Table browser with keyset pagination."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+pgnative-schema-model = { path = "../../schema/model" }
+pgnative-results-value = { path = "../value" }
+pgnative-results-store = { path = "../store" }

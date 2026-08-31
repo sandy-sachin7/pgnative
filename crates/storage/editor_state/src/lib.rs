@@ -1,0 +1,1 @@
+//! Editor tabs persistence.

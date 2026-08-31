@@ -11,7 +11,11 @@ use crate::types::{
 fn sample_model() -> crate::index::SchemaModel {
     let mut b = Builder::new();
     let s = SchemaId(Id(0));
-    b.add_schema(Schema { id: s, name: "public".into(), comment: None });
+    b.add_schema(Schema {
+        id: s,
+        name: "public".into(),
+        comment: None,
+    });
 
     let rel = RelationId(Id(0));
     b.add_relation(Relation {
@@ -50,7 +54,13 @@ fn sample_model() -> crate::index::SchemaModel {
         foreign_keys_in: Vec::new(),
         comment: None,
     });
-    b.set_primary_key(rel, PrimaryKey { columns: vec![crate::types::ColumnId(Id(0))], name: Some("users_pkey".into()) });
+    b.set_primary_key(
+        rel,
+        PrimaryKey {
+            columns: vec![crate::types::ColumnId(Id(0))],
+            name: Some("users_pkey".into()),
+        },
+    );
     b.add_type(TypeId(Id(0)), "int4".into());
     b.add_type(TypeId(Id(1)), "varchar".into());
     b.add_function(Function {
@@ -82,7 +92,10 @@ fn relation_editability_uses_primary_key() {
 fn relation_lookup_by_oid_and_id() {
     let m = sample_model();
     assert_eq!(m.relation_by_oid(Oid(1)).map(|r| &*r.name), Some("users"));
-    assert_eq!(m.relation(RelationId(Id(0))).map(|r| &*r.name), Some("users"));
+    assert_eq!(
+        m.relation(RelationId(Id(0))).map(|r| &*r.name),
+        Some("users")
+    );
 }
 
 #[test]

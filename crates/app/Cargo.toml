@@ -1,0 +1,24 @@
+[package]
+name = "pgnative-app"
+description = "Application orchestration (Command/Event, state machines)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+pgnative-schema-model = { path = "../schema/model" }
+pgnative-results-value = { path = "../results/value" }
