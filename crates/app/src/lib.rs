@@ -88,13 +88,27 @@ pub enum AppEvent {
     DisconnectRequiresDecision {
         id: ConnectionId,
     },
+    PreferencesRestored {
+        ui_state: pgnative_ui_layout::UiState,
+    },
+    HistoryResults {
+        results: Vec<String>,
+    },
 }
 
 /// Domain state — AppState (§54), separate from UiState.
+///
+/// NOTE: `schema` duplicates `pgnative_schema_cache::SchemaCache` state.
+/// `SchemaCache` is the canonical TTL/epoch store (hot, epoch increments on
+/// every `set_ready*`). `AppState::schema` is kept in sync via
+/// `SchemaUpdated` events and should eventually be replaced by a shared
+/// `SchemaCache` instance to avoid divergence.
 #[derive(Debug, Default)]
 pub struct AppState {
     pub connections: HashMap<ConnectionId, ConnectionState>,
     pub queries: HashMap<QueryId, String>,
+    /// Derived from `connections` (`ConnectionState::tx()` is canonical); kept for
+    /// fast `disconnect_requires_decision` check and updated via `set_tx` / poll_events.
     pub tx: HashMap<ConnectionId, TxState>,
     pub schema: RwLock<Option<Arc<SchemaModel>>>,
 }
@@ -125,6 +139,8 @@ impl AppState {
     }
 }
 
+pub mod runtime;
+
 /// Controller — owns channels + optional Tokio JoinSet drain.
 ///
 /// Channels are bounded (256) per §8 back-pressure contract.
@@ -133,7 +149,7 @@ pub struct AppController {
     pub cmd_rx: Receiver<AppCommand>,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Receiver<AppEvent>,
-    pub state: AppState,
+    pub state: Arc<RwLock<AppState>>,
 }
 
 impl AppController {
@@ -146,12 +162,17 @@ impl AppController {
             cmd_rx,
             event_tx,
             event_rx,
-            state: AppState::new(),
+            state: Arc::new(RwLock::new(AppState::new())),
         }
     }
 
     pub fn send_command(&self, cmd: AppCommand) {
-        let _ = self.cmd_tx.send(cmd);
+        // §30: never block UI thread; bounded 256.
+        // NOTE: after PgnativeApp::new swaps cmd_rx with a dummy receiver,
+        // self.cmd_rx is not paired with cmd_tx — do not try to drain it.
+        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.cmd_tx.try_send(cmd) {
+            tracing::warn!("cmd channel full — dropping command");
+        }
     }
 
     pub fn drain_events(&self) -> Vec<AppEvent> {
@@ -168,7 +189,8 @@ impl AppController {
     }
 
     pub fn emit(&self, ev: AppEvent) {
-        let _ = self.event_tx.send(ev);
+        // Non-blocking; drop if UI not draining fast enough
+        let _ = self.event_tx.try_send(ev);
     }
 }
 
@@ -227,53 +249,79 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         .unwrap_or(0);
 
     if version < 1 {
-        // v1: baseline tables from storage crates
-        pgnative_storage_connections::init(conn).map_err(|e| match e {
-            pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_history::init(conn).map_err(|e| match e {
-            pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_editor_state::init(conn).map_err(|e| match e {
-            pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
-        })?;
-        pgnative_storage_preferences::init(conn).map_err(|e| match e {
-            pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
-            pgnative_storage_preferences::PrefError::Json(_) => {
-                rusqlite::Error::InvalidParameterName("json".into())
+        conn.execute("BEGIN", [])?;
+        let res: Result<(), rusqlite::Error> = (|| {
+            // v1: baseline tables from storage crates
+            pgnative_storage_connections::init(conn).map_err(|e| match e {
+                pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_history::init(conn).map_err(|e| match e {
+                pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_editor_state::init(conn).map_err(|e| match e {
+                pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
+            })?;
+            pgnative_storage_preferences::init(conn).map_err(|e| match e {
+                pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
+                pgnative_storage_preferences::PrefError::Json(_) => {
+                    rusqlite::Error::InvalidParameterName("json".into())
+                }
+            })?;
+            conn.execute("PRAGMA user_version=1", [])?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
             }
-        })?;
-        conn.execute("PRAGMA user_version=1", [])?;
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        }
     }
     if version < 2 {
-        // v2: add updated_at column to connections if missing (backwards-aware)
-        // and create index on history.connection_id
-        let has_updated: bool = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='connections'")
-            .ok()
-            .and_then(|mut s| {
-                s.query_row([], |r| r.get::<_, Option<String>>(0))
-                    .ok()
-                    .flatten()
-            })
-            .map(|sql| sql.contains("updated_at"))
-            .unwrap_or(false);
-        if !has_updated {
-            // ALTER TABLE is idempotent via try; ignore if column exists
+        conn.execute("BEGIN", [])?;
+        let res: Result<(), rusqlite::Error> = (|| {
+            // v2: add updated_at column to connections if missing (backwards-aware)
+            // and create index on history.connection_id
+            let has_updated: bool = conn
+                .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='connections'")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_row([], |r| r.get::<_, Option<String>>(0))
+                        .ok()
+                        .flatten()
+                })
+                .map(|sql| sql.contains("updated_at"))
+                .unwrap_or(false);
+            if !has_updated {
+                // ALTER TABLE is idempotent via try; ignore if column exists
+                let _ = conn.execute(
+                    "ALTER TABLE connections ADD COLUMN updated_at INTEGER DEFAULT NULL",
+                    [],
+                );
+            }
             let _ = conn.execute(
-                "ALTER TABLE connections ADD COLUMN updated_at INTEGER DEFAULT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_history_connection ON history(connection_id)",
                 [],
             );
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC)",
+                [],
+            );
+            conn.execute("PRAGMA user_version=2", [])?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
         }
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_connection ON history(connection_id)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC)",
-            [],
-        );
-        conn.execute("PRAGMA user_version=2", [])?;
     }
     Ok(())
 }
@@ -326,6 +374,10 @@ pub struct PgnativeApp {
     pub connection_form: pgnative_ui_connections::ConnectionForm,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
+    completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
+    completion_schema_ptr: Option<*const pgnative_schema_model::SchemaModel>,
+    runtime_handle: Option<tokio::task::JoinHandle<()>>,
+    last_editor_persist: std::time::Instant,
 }
 
 impl PgnativeApp {
@@ -335,18 +387,47 @@ impl PgnativeApp {
         let theme = pgnative_ui_theme::Theme::dark();
         cc.egui_ctx.set_visuals(theme.visuals());
 
-        // Restore UI state from SQLite preferences if present
-        let mut ui_state = pgnative_ui_layout::UiState::default();
-        if let Ok(conn) = open_app_db(&app_db_path()) {
-            if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
-                if let Ok(restored) = serde_json::from_value::<pgnative_ui_layout::UiState>(v) {
-                    ui_state = restored;
+        // Restore UI state: default immediately; load persisted state off UI thread.
+        let ui_state = pgnative_ui_layout::UiState::default();
+
+        let store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>> = Arc::new(
+            parking_lot::RwLock::new(pgnative_results_store::ResultStore::new(
+                pgnative_results_store::StoreConfig::default(),
+            )),
+        );
+        let mut controller = AppController::new();
+        let mut runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // Spawn single AppRuntime dispatcher if a Tokio handle is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let (_dummy_tx, dummy_rx) = crossbeam_channel::bounded::<AppCommand>(256);
+            let cmd_rx = std::mem::replace(&mut controller.cmd_rx, dummy_rx);
+            let event_tx = controller.event_tx.clone();
+            let state = Arc::clone(&controller.state);
+            let store_clone = Arc::clone(&store);
+            let rt_handle =
+                crate::runtime::spawn_runtime(cmd_rx, event_tx.clone(), store_clone, state);
+            // Keep handle so Drop can abort; also forward completion
+            runtime_handle = Some(handle.spawn(async move {
+                let _ = rt_handle.await;
+            }));
+            // Load persisted UI state off the render thread (§30)
+            let ev_tx = event_tx;
+            handle.spawn_blocking(move || {
+                if let Ok(conn) = open_app_db(&app_db_path()) {
+                    if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
+                        if let Ok(restored) =
+                            serde_json::from_value::<pgnative_ui_layout::UiState>(v)
+                        {
+                            let _ = ev_tx
+                                .try_send(AppEvent::PreferencesRestored { ui_state: restored });
+                        }
+                    }
                 }
-            }
+            });
         }
 
         Self {
-            controller: AppController::new(),
+            controller,
             ui_state,
             viewport: pgnative_results_viewport::ViewportState::default(),
             theme,
@@ -356,11 +437,11 @@ impl PgnativeApp {
             history_query: String::new(),
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
-            store: Arc::new(parking_lot::RwLock::new(
-                pgnative_results_store::ResultStore::new(
-                    pgnative_results_store::StoreConfig::default(),
-                ),
-            )),
+            store,
+            completion_cache: None,
+            completion_schema_ptr: None,
+            runtime_handle,
+            last_editor_persist: std::time::Instant::now() - std::time::Duration::from_secs(1),
         }
     }
 
@@ -374,14 +455,113 @@ impl PgnativeApp {
                     tracing::info!(state = %state, "connection state");
                 }
                 AppEvent::Error { op, message } => {
-                    tracing::warn!(op = %op, message = %message, "app error");
+                    // Back-compat: history search still emits Error{op:"history"} until
+                    // runtime migrates to HistoryResults (small append, no break).
+                    if op == "history" {
+                        if message.is_empty() {
+                            self.history_results.clear();
+                        } else {
+                            self.history_results =
+                                message.split("\n---\n").map(|s| s.to_string()).collect();
+                        }
+                    } else {
+                        tracing::warn!(op = %op, message = %message, "app error");
+                    }
                 }
                 AppEvent::DisconnectRequiresDecision { id } => {
                     tracing::warn!(%id, "disconnect requires decision — active tx");
                 }
+                AppEvent::PreferencesRestored { ui_state } => {
+                    self.ui_state = ui_state;
+                }
+                AppEvent::HistoryResults { results } => {
+                    self.history_results = results;
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Shortcuts: Ctrl+Enter execute, Esc cancel, F5 refresh (§32).
+    /// Must be called from `ui()` after `ctx` is cloned; uses `ctx.input`.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+Enter → execute active tab
+        let exec = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+        if exec {
+            if let Some(tab_id) = self.active_tab.clone() {
+                if let Some(tab) = self.editor_tabs.get(&tab_id) {
+                    if let Some(conn_id) = self
+                        .controller
+                        .state
+                        .read()
+                        .connections
+                        .keys()
+                        .next()
+                        .copied()
+                    {
+                        self.controller.send_command(AppCommand::Execute {
+                            tab: tab.id.clone(),
+                            sql: tab.content.clone(),
+                            connection: conn_id,
+                        });
+                    }
+                }
+            }
+        }
+        // Esc → cancel last query
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                self.controller
+                    .send_command(AppCommand::Cancel { query_id: qid });
+            }
+        }
+        // F5 → refresh schema
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            if let Some(conn_id) = self
+                .controller
+                .state
+                .read()
+                .connections
+                .keys()
+                .next()
+                .copied()
+            {
+                self.controller.send_command(AppCommand::RefreshSchema {
+                    connection: conn_id,
+                });
+            }
+        }
+    }
+
+    fn tx_badge_text(&self) -> Option<(String, egui::Color32)> {
+        // Derive from canonical ConnectionState::tx() plus AppState::tx fallback.
+        let state = self.controller.state.read();
+        for cs in state.connections.values() {
+            if let Some(tx) = cs.tx_state() {
+                match tx {
+                    TxState::Idle => {}
+                    TxState::InTransaction { .. } => {
+                        return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
+                    }
+                    TxState::InFailedTransaction => {
+                        return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
+                    }
+                }
+            }
+        }
+        // Fallback to explicit tx map (covers optimistic classify_tx before ReadyForQuery)
+        for tx in state.tx.values() {
+            match tx {
+                TxState::InTransaction { .. } => {
+                    return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
+                }
+                TxState::InFailedTransaction => {
+                    return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
+                }
+                TxState::Idle => {}
+            }
+        }
+        None
     }
 }
 
@@ -390,11 +570,27 @@ impl eframe::App for PgnativeApp {
         // Poll controller events (non-blocking) before render
         self.poll_events();
         let ctx = ui.ctx().clone();
+        // Keyboard shortcuts (§32): Ctrl+Enter execute, Esc cancel, F5 refresh
+        self.handle_shortcuts(&ctx);
 
-        // Top bar: connection + theme toggle
+        // Top bar: connection + Tx badge + theme toggle
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("pgNative");
+                ui.label(egui::RichText::new("pgNative").strong());
+                // Tx badge (§22) — visible when any connection is in transaction
+                if let Some((label, color)) = self.tx_badge_text() {
+                    let badge = egui::RichText::new(label)
+                        .color(egui::Color32::WHITE)
+                        .small()
+                        .strong();
+                    egui::Frame::new()
+                        .fill(color)
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            ui.label(badge);
+                        });
+                }
                 if ui.button("New Tab").clicked() {
                     let id = format!("tab-{}", self.editor_tabs.len() + 1);
                     self.editor_tabs
@@ -405,8 +601,15 @@ impl eframe::App for PgnativeApp {
                     });
                 }
                 if ui.button("Refresh Schema").clicked() {
-                    // Use first connection if any
-                    if let Some((&id, _)) = self.controller.state.connections.iter().next() {
+                    if let Some(id) = self
+                        .controller
+                        .state
+                        .read()
+                        .connections
+                        .keys()
+                        .next()
+                        .copied()
+                    {
                         self.controller
                             .send_command(AppCommand::RefreshSchema { connection: id });
                     }
@@ -479,23 +682,58 @@ impl eframe::App for PgnativeApp {
                     if resp.changed() {
                         tab.content = content;
                         tab.cursor = tab.content.len();
-                        // Persist editor tab content (best-effort, no blocking toast)
-                        if let Ok(conn) = open_app_db(&app_db_path()) {
-                            let _ = pgnative_storage_editor_state::upsert(
-                                &conn,
-                                &pgnative_storage_editor_state::EditorTab {
-                                    tab_id: tab.id.clone(),
-                                    connection_id: None,
-                                    content: tab.content.clone(),
-                                    cursor: tab.cursor,
-                                    selection: None,
-                                },
-                            );
+                        // Persist off UI thread per §30 — debounced to avoid per-keystroke thread explosion.
+                        let now = std::time::Instant::now();
+                        let debounce = std::time::Duration::from_millis(350);
+                        if now.duration_since(self.last_editor_persist) >= debounce {
+                            self.last_editor_persist = now;
+                            let tab_id_clone = tab.id.clone();
+                            let content_clone = tab.content.clone();
+                            let cursor_clone = tab.cursor;
+                            let persist = move || {
+                                if let Ok(conn) = open_app_db(&app_db_path()) {
+                                    let _ = pgnative_storage_editor_state::upsert(
+                                        &conn,
+                                        &pgnative_storage_editor_state::EditorTab {
+                                            tab_id: tab_id_clone,
+                                            connection_id: None,
+                                            content: content_clone,
+                                            cursor: cursor_clone,
+                                            selection: None,
+                                        },
+                                    );
+                                }
+                            };
+                            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                                h.spawn_blocking(persist);
+                            } else {
+                                std::thread::spawn(persist);
+                            }
                         }
                     }
-                    // Completion preview (engine built from current schema snapshot)
+                    // Completion preview — cache engine per schema Arc ptr per §30.
                     if let Some(schema) = &self.schema {
-                        let engine = pgnative_schema_completion::CompletionEngine::new(schema);
+                        let ptr = Arc::as_ptr(schema);
+                        let engine: Arc<pgnative_schema_completion::CompletionEngine> =
+                            if self.completion_schema_ptr == Some(ptr) {
+                                if let Some(cached) = self.completion_cache.as_ref() {
+                                    Arc::clone(cached)
+                                } else {
+                                    let e = Arc::new(
+                                        pgnative_schema_completion::CompletionEngine::new(schema),
+                                    );
+                                    self.completion_cache = Some(Arc::clone(&e));
+                                    self.completion_schema_ptr = Some(ptr);
+                                    e
+                                }
+                            } else {
+                                let e = Arc::new(
+                                    pgnative_schema_completion::CompletionEngine::new(schema),
+                                );
+                                self.completion_cache = Some(Arc::clone(&e));
+                                self.completion_schema_ptr = Some(ptr);
+                                e
+                            };
                         // Prefix = last word before cursor
                         let prefix = tab
                             .content
@@ -512,8 +750,14 @@ impl eframe::App for PgnativeApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Run (Ctrl+Enter)").clicked() {
-                            if let Some((&conn_id, _)) =
-                                self.controller.state.connections.iter().next()
+                            if let Some(conn_id) = self
+                                .controller
+                                .state
+                                .read()
+                                .connections
+                                .keys()
+                                .next()
+                                .copied()
                             {
                                 self.controller.send_command(AppCommand::Execute {
                                     tab: tab.id.clone(),
@@ -524,9 +768,11 @@ impl eframe::App for PgnativeApp {
                         }
                         if ui.button("Cancel (Esc)").clicked() {
                             // Cancel last query if any
-                            if let Some((qid, _)) = self.controller.state.queries.iter().next() {
+                            if let Some(qid) =
+                                self.controller.state.read().queries.keys().next().copied()
+                            {
                                 self.controller
-                                    .send_command(AppCommand::Cancel { query_id: *qid });
+                                    .send_command(AppCommand::Cancel { query_id: qid });
                             }
                         }
                     });
@@ -546,6 +792,34 @@ impl eframe::App for PgnativeApp {
                 snap.rows.len(),
                 snap.state
             ));
+            // Export wiring placeholder (§28) — streams via runtime Export command
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Export:").weak().small());
+                if ui.small_button("CSV").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::Csv,
+                        });
+                    }
+                }
+                if ui.small_button("JSON").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::Json,
+                        });
+                    }
+                }
+                if ui.small_button("SQL").clicked() {
+                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                        self.controller.send_command(AppCommand::Export {
+                            query_id: qid,
+                            format: ExportFormat::SqlInsert,
+                        });
+                    }
+                }
+            });
         });
 
         // Connections panel at bottom (collapsible)
@@ -563,6 +837,14 @@ impl eframe::App for PgnativeApp {
 
         // Repaint when streaming results
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+impl Drop for PgnativeApp {
+    fn drop(&mut self) {
+        if let Some(h) = self.runtime_handle.take() {
+            h.abort();
+        }
     }
 }
 

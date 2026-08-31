@@ -84,9 +84,7 @@ pub fn set_persisted_buffers(conn: &Connection, enabled: bool) -> Result<(), Edi
 pub fn upsert(conn: &Connection, tab: &EditorTab) -> Result<(), EditorError> {
     // Respect product decision: OFF by default — never persist arbitrary SQL containing secrets unless explicit opt-in.
     if !persisted_buffers_enabled(conn).unwrap_or(false) {
-        // Still persist cursor/selection history (LRU 1000) but not content.
-        // No-op for content persistence; caller should gate `content` at App layer.
-        // For now we still upsert but App layer will pass empty content when OFF.
+        return Ok(());
     }
     let (sel_start, sel_end) = tab.selection.unzip();
     conn.execute(

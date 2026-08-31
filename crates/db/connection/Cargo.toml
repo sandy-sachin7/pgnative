@@ -16,9 +16,11 @@ tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }
+webpki-roots = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+base64 = "0.22"

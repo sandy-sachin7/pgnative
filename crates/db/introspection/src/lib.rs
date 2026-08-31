@@ -69,10 +69,14 @@ pub enum IntrospectionError {
 // Client-bound fetch helpers
 // ---------------------------------------------------------------------------
 
-/// Set introspection session parameters (statement_timeout 5s, read-only).
+/// Set introspection session parameters (statement_timeout 5s).
+/// Previously set `default_transaction_read_only=on` session-scoped, which
+/// leaked to user queries and broke writes (§7). Now only sets timeout;
+/// introspection queries are read-only by nature and don't need session
+/// persistence. Caller may wrap introspection in `BEGIN READ ONLY` if desired.
 pub async fn prepare_session(client: &tokio_postgres::Client) -> Result<(), IntrospectionError> {
     client
-        .batch_execute("SET statement_timeout = '5s'; SET TRANSACTION READ ONLY;")
+        .batch_execute("SET statement_timeout = '5s';")
         .await?;
     Ok(())
 }
@@ -232,9 +236,7 @@ pub async fn introspect(
     let fks = fetch_constraints_fk(client).await?;
     let functions = fetch_functions(client).await?;
 
-    Ok(hydrate::build_full(
-        schemas, relations, columns, pk_unique, fks, functions,
-    ))
+    hydrate::build_full(schemas, relations, columns, pk_unique, fks, functions)
 }
 
 /// Phase-A only introspection — caller can publish this model first, then enrich.
@@ -244,7 +246,7 @@ pub async fn introspect_phase_a(
     let schemas = fetch_schemas(client).await?;
     let relations = fetch_relations(client).await?;
     let columns = fetch_columns(client).await?;
-    Ok(hydrate::phase_a(schemas, relations, columns))
+    hydrate::phase_a(schemas, relations, columns)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +271,7 @@ pub mod hydrate {
             String,
             String,
         )>,
-    ) -> SchemaModel {
+    ) -> Result<SchemaModel, IntrospectionError> {
         build_full(
             schemas,
             relations,
@@ -299,18 +301,26 @@ pub mod hydrate {
         pk_unique: Vec<(Oid, String, char, Option<Vec<i16>>)>,
         fks: Vec<(Oid, String, Oid, Oid, Option<Vec<i16>>, Option<Vec<i16>>)>,
         functions: Vec<(Oid, Oid, String, String, String, char)>,
-    ) -> SchemaModel {
+    ) -> Result<SchemaModel, IntrospectionError> {
+        // BUG #7 fix: never synthesize phantom Id(0) when DB has no schemas.
+        if schemas.is_empty() {
+            return Err(IntrospectionError::Other("no schemas found".into()));
+        }
         let mut b = Builder::new();
 
         // 1) Schemas — dense Ids, oid→SchemaId map.
         let mut schema_by_oid: HashMap<Oid, Id> = HashMap::new();
         for (idx, (oid, name, comment)) in schemas.into_iter().enumerate() {
-            let id = Id(idx as u32);
+            let id = Id(u32::try_from(idx).expect("schema idx fits u32"));
             schema_by_oid.insert(oid, id);
             b.add_schema(Schema { id, name, comment });
         }
-        // Fallback schema for orphan relations.
-        let fallback_schema = schema_by_oid.values().next().copied().unwrap_or(Id(0));
+        // Fallback schema for orphan relations (safe now: schemas non-empty).
+        let fallback_schema = schema_by_oid
+            .values()
+            .next()
+            .copied()
+            .expect("schemas non-empty checked above");
 
         // 2) Types — deduplicate type OIDs.
         let mut type_by_oid: HashMap<Oid, Id> = HashMap::new();
@@ -392,7 +402,7 @@ pub mod hydrate {
                 'p' => RelationKind::Table, // partitioned table treated as Table
                 _ => RelationKind::Table,
             };
-            let rel_id = Id(idx as u32);
+            let rel_id = Id(u32::try_from(idx).expect("relation idx fits u32"));
             rel_by_oid.insert(rel_oid, rel_id);
 
             // Columns for this relation
@@ -521,16 +531,19 @@ pub mod hydrate {
                 referenced_relation: dst_id,
                 referenced: referenced.clone(),
             };
-            // out side
+            // out side (child → parent)
             if let Some(rel) = relations_tmp.iter_mut().find(|r| r.id == src_id) {
                 rel.foreign_keys_out.push(fk.clone());
             }
-            // in side (reverse)
+            // in side (parent perspective — swap direction so parent sees inbound)
+            // ARCH CRITICAL: previously duplicated fk direction; now correctly:
+            // referencing = parent cols (original referenced), referenced = child cols,
+            // referenced_relation = child (src_id).
             let fk_in = ForeignKey {
                 name: Some(conname),
-                referencing,
-                referenced_relation: dst_id,
-                referenced,
+                referencing: referenced,
+                referenced_relation: src_id,
+                referenced: referencing,
             };
             if let Some(rel) = relations_tmp.iter_mut().find(|r| r.id == dst_id) {
                 rel.foreign_keys_in.push(fk_in);
@@ -550,7 +563,7 @@ pub mod hydrate {
                 .get(&ns_oid)
                 .copied()
                 .unwrap_or(fallback_schema);
-            let fid = Id(idx as u32);
+            let fid = Id(u32::try_from(idx).expect("function idx fits u32"));
             b.add_function(Function {
                 id: fid,
                 schema,
@@ -561,7 +574,7 @@ pub mod hydrate {
             });
         }
 
-        b.build()
+        Ok(b.build())
     }
 }
 
@@ -609,7 +622,7 @@ mod tests {
                 "".into(),
             ),
         ];
-        let m = hydrate::phase_a(schemas, relations, columns);
+        let m = hydrate::phase_a(schemas, relations, columns).unwrap();
         assert_eq!(m.schemas().len(), 1);
         assert_eq!(m.relations().len(), 1);
         let rel = &m.relations()[0];
@@ -673,12 +686,18 @@ mod tests {
             Some(vec![2]),
             Some(vec![1]),
         )];
-        let m = hydrate::build_full(schemas, relations, columns, pk, fks, Vec::new());
+        let m = hydrate::build_full(schemas, relations, columns, pk, fks, Vec::new()).unwrap();
         let users = m.relation_by_oid(Oid(1)).unwrap();
         assert!(users.primary_key.is_some());
         let posts = m.relation_by_oid(Oid(2)).unwrap();
         assert_eq!(posts.foreign_keys_out.len(), 1);
         assert_eq!(users.foreign_keys_in.len(), 1);
+        // Verify FK direction is correctly swapped for inbound.
+        let fk_in = &users.foreign_keys_in[0];
+        // inbound referencing should be parent (users.id) and referenced should be child (posts.user_id)
+        // and referenced_relation should point to child (posts)
+        let posts_id = posts.id;
+        assert_eq!(fk_in.referenced_relation, posts_id);
     }
 
     #[test]
@@ -709,7 +728,7 @@ mod tests {
                 "a".into(),
             ),
         ];
-        let m = hydrate::phase_a(schemas, relations, columns);
+        let m = hydrate::phase_a(schemas, relations, columns).unwrap();
         let rel = &m.relations()[0];
         assert_eq!(
             rel.columns[0].value_source,
@@ -719,5 +738,16 @@ mod tests {
             rel.columns[1].value_source,
             pgnative_schema_model::types::ValueSource::Identity
         );
+    }
+
+    #[test]
+    fn hydrate_empty_schemas_errors() {
+        let schemas = vec![];
+        let relations = vec![(Oid(1), Oid(2200), "users".into(), 'r', None)];
+        let columns = vec![];
+        let res = hydrate::phase_a(schemas, relations, columns);
+        assert!(res.is_err());
+        let res2 = hydrate::build_full(vec![], vec![], vec![], vec![], vec![], vec![]);
+        assert!(res2.is_err());
     }
 }

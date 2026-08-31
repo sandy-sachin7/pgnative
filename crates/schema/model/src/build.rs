@@ -22,9 +22,10 @@ impl Builder {
     pub fn add_schema(&mut self, schema: Schema) -> SchemaId {
         let id = schema.id;
         self.model.schemas.push(schema);
-        self.model
-            .schema_by_name
-            .insert(self.model.schemas.last().unwrap().name.clone(), id);
+        self.model.schema_by_name.insert(
+            self.model.schemas.last().expect("just pushed").name.clone(),
+            id,
+        );
         id
     }
 
@@ -32,7 +33,7 @@ impl Builder {
     pub fn add_relation(&mut self, relation: Relation) -> RelationId {
         let id = relation.id;
         self.model.relations.push(relation);
-        let rt = self.model.relations.last().unwrap();
+        let rt = self.model.relations.last().expect("just pushed");
         self.model.sorted_relations.push(id);
         self.model.relation_by_oid.insert(rt.oid, id);
         self.model
@@ -50,7 +51,7 @@ impl Builder {
     pub fn add_function(&mut self, function: Function) -> FunctionId {
         let id = function.id;
         self.model.functions.push(function);
-        let f = self.model.functions.last().unwrap();
+        let f = self.model.functions.last().expect("just pushed");
         self.model
             .functions_by_schema
             .entry(f.schema)
@@ -70,10 +71,11 @@ impl Builder {
     ///
     /// Panics if `relation` is not a known relation id in this model.
     pub fn set_primary_key(&mut self, relation: RelationId, pk: PrimaryKey) {
+        let idx = usize::try_from(relation.0).expect("RelationId fits usize");
         let rel = self
             .model
             .relations
-            .get_mut(relation.0 as usize)
+            .get_mut(idx)
             .expect("relation must exist before setting its primary key");
         rel.primary_key = Some(pk);
     }
@@ -83,17 +85,21 @@ impl Builder {
     pub fn build(mut self) -> SchemaModel {
         // Ensure deterministic ordering of relations by schema then name.
         self.model.sorted_relations.sort_by(|a, b| {
-            self.model.relations[a.0 as usize]
+            let ai = usize::try_from(a.0).expect("RelationId fits usize");
+            let bi = usize::try_from(b.0).expect("RelationId fits usize");
+            self.model.relations[ai]
                 .name
-                .cmp(&self.model.relations[b.0 as usize].name)
+                .cmp(&self.model.relations[bi].name)
         });
         let mut by_schema: Vec<(SchemaId, Vec<RelationId>)> =
             self.model.relations_by_schema.drain().collect();
         for (_schema, ids) in &mut by_schema {
             ids.sort_by(|a, b| {
-                self.model.relations[a.0 as usize]
+                let ai = usize::try_from(a.0).expect("RelationId fits usize");
+                let bi = usize::try_from(b.0).expect("RelationId fits usize");
+                self.model.relations[ai]
                     .name
-                    .cmp(&self.model.relations[b.0 as usize].name)
+                    .cmp(&self.model.relations[bi].name)
             });
         }
         self.model.relations_by_schema = by_schema.into_iter().collect();

@@ -10,10 +10,22 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Per-cell byte cap (§19) — large text/json/bytea truncated at stream.
-pub const PER_CELL_CAP: usize = 256 * 1024;
+/// Budget: 64 KiB per cell vs 64 MiB store (§15) and channel_cap=16 (§C2)
+/// mitigates worst-case memory; theoretical 10×64 KiB×10 cols ≈ 6.4 MiB per
+/// batch is bounded by store eviction.
+pub const PER_CELL_CAP: usize = 64 * 1024;
 
 /// Render truncation cap (viewport shows affordance beyond this).
 pub const RENDER_CAP: usize = 2 * 1024;
+
+#[inline]
+fn is_utf8_boundary(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 || idx >= bytes.len() {
+        return true;
+    }
+    // Continuation bytes 10xxxxxx are not boundaries
+    (bytes[idx] & 0b1100_0000) != 0b1000_0000
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -26,8 +38,8 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             per_cell_cap: PER_CELL_CAP,
-            batch_size: 256,
-            channel_cap: 512,
+            batch_size: 64,
+            channel_cap: 16,
         }
     }
 }
@@ -94,15 +106,20 @@ pub fn decode_cell_with_cap(raw: Option<&[u8]>, oid: u32, cap: usize) -> CellVal
     let Some(bytes) = raw else {
         return CellValue::Null;
     };
-    // Truncate large values at stream — renderer shows affordance (C8).
-    let truncated = if bytes.len() > cap {
-        &bytes[..cap]
-    } else {
-        bytes
-    };
-    // If truncated, we always return Text with truncated bytes (authoritative).
-    let was_truncated = bytes.len() > cap;
-    if was_truncated {
+    // Truncate large values at stream — UTF-8 safe at char boundary (C8).
+    // TODO(§19): truncated jsonb/bytea coerced to Text; preserve variant
+    // after truncation if downstream needs type fidelity.
+    if bytes.len() > cap {
+        let mut end = cap;
+        while end > 0 && !is_utf8_boundary(bytes, end) {
+            end -= 1;
+        }
+        if end == 0 {
+            // cap landed inside first char (cap=1 with multi-byte); return empty
+            // rather than reintroducing invalid UTF-8 via max(1) (crates/results/stream/src/lib.rs:107)
+            return CellValue::Text(Bytes::new());
+        }
+        let truncated = &bytes[..end.min(bytes.len())];
         return CellValue::Text(Bytes::copy_from_slice(truncated));
     }
     match oid {
@@ -269,10 +286,17 @@ where
             Ok(pg_row) => {
                 let mut cells = Vec::with_capacity(oids.len());
                 for (i, oid) in oids.iter().enumerate() {
-                    // Text-protocol decode: get Option<&str> then map to bytes.
-                    // This works for all types via PG text format; bytea \x hex is handled in decode.
-                    let raw: Option<&[u8]> =
-                        pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes());
+                    // Text-protocol decode via `Option<&str>` (covers all types in text
+                    // format; bytea arrives as \x hex which decode_cell handles).
+                    // For OID 17 when PG sends binary, fall back to `&[u8]`.
+                    let raw: Option<&[u8]> = if *oid == 17 {
+                        // Try binary bytea first via raw bytes, else text hex.
+                        pg_row
+                            .get::<usize, Option<&[u8]>>(i)
+                            .or_else(|| pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes()))
+                    } else {
+                        pg_row.get::<usize, Option<&str>>(i).map(|s| s.as_bytes())
+                    };
                     let cv = decode_cell_with_cap(raw, *oid, config.per_cell_cap);
                     cells.push(cv);
                 }
@@ -467,7 +491,9 @@ mod tests {
         };
         let (tx, mut rx) = channel(&cfg);
         let rows = (0..5).map(|i| vec![Some(format!("{i}").into_bytes()), Some(b"hello".to_vec())]);
-        drive_iter(rows, cols, cfg, tx).await;
+        // Run producer concurrently: with channel_cap=2 the 3rd send would block
+        // forever if we awaited drive_iter before draining rx (deadlock).
+        let producer = tokio::spawn(drive_iter(rows, cols, cfg, tx));
         // Should receive Meta, then batches of 2,2,1 then Complete
         let mut batches = 0;
         let mut total_rows = 0;
@@ -491,6 +517,7 @@ mod tests {
         assert!(saw_complete);
         assert_eq!(total_rows, 5);
         assert_eq!(batches, 3);
+        producer.await.unwrap();
     }
 
     #[tokio::test]

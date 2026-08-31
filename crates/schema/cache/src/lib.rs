@@ -1,6 +1,14 @@
 //! Schema cache — Arc<SchemaModel> behind ArcSwap, two-phase + 24h TTL.
 //! Implements ADR-0007 per plan B5-B7. Readers are lock-free via ArcSwap.
 //! Persisted cache: 24h TTL, stale-while-refresh, explicit refresh bypasses TTL.
+//!
+//! NOTE (HIGH): `crates/app` currently holds `AppState::schema: RwLock<Option<Arc<SchemaModel>>>`
+//! which duplicates this cache's `CacheState::Ready`. The cache is the canonical
+//! source of truth for schema TTL/epoch and should eventually be wired into
+//! `AppState` / `AppController` to avoid divergence. For now `AppState::schema`
+//! is kept in sync via `SchemaUpdated` events; `SchemaCache` epoch increments
+//! on every `set_ready*` (hot) and is tested in `epoch_increments`.
+//! TODO: wire `SchemaCache` into `AppState` or remove duplication.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
