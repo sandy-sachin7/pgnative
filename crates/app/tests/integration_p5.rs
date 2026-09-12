@@ -396,7 +396,7 @@ async fn edit_live_roundtrip() {
 }
 
 #[tokio::test]
-async fn tx_disconnect_blocks() {
+async fn tx_disconnect_dialog_flow() {
     let Some(parts) = pg_params().await else {
         eprintln!("SKIP: no TEST_PG_URL and Docker not available");
         return;
@@ -419,8 +419,8 @@ async fn tx_disconnect_blocks() {
     );
     exec_ok(&h, "tx1", "INSERT INTO p5_tx_probe VALUES (1)").await;
 
-    // Disconnect with an open txn must emit the decision hook — never a
-    // silent commit or silent rollback.
+    // Disconnect with an open txn must emit the decision hook and KEEP the
+    // session — no silent commit, no silent rollback, no teardown.
     h.cmd_tx
         .send(AppCommand::Disconnect { id: h.conn_id })
         .expect("send Disconnect");
@@ -432,8 +432,42 @@ async fn tx_disconnect_blocks() {
         decision.is_some(),
         "Disconnect with open txn must emit DisconnectRequiresDecision"
     );
+    let torn_down = wait_for(&h.event_rx, Duration::from_secs(2), |ev| {
+        matches!(
+            ev,
+            AppEvent::ConnectionStateChanged { state, .. } if state == "disconnected"
+        )
+    })
+    .await;
+    assert!(
+        torn_down.is_none(),
+        "session must stay alive until the dialog resolves"
+    );
 
-    // Fresh session: the uncommitted row must be gone (rolled back on close).
+    // Session still answers queries while the dialog is pending.
+    exec_ok(&h, "tx1", "SELECT 1").await;
+
+    // Rollback + disconnect: teardown emits `disconnected`, clears tracked tx,
+    // and the uncommitted row is gone (rolled back on close — never committed).
+    h.cmd_tx
+        .send(AppCommand::ResolveTransaction {
+            id: h.conn_id,
+            commit: false,
+        })
+        .expect("send ResolveTransaction");
+    let down = wait_for(&h.event_rx, Duration::from_secs(5), |ev| {
+        matches!(
+            ev,
+            AppEvent::ConnectionStateChanged { state, .. } if state == "disconnected"
+        )
+    })
+    .await;
+    assert!(down.is_some(), "rollback must disconnect");
+    assert!(
+        h.state.read().tx.get(&h.conn_id).is_none(),
+        "teardown must clear tracked tx state"
+    );
+
     let probe = setup_client(&parts).await;
     let n: i64 = probe
         .client
@@ -450,6 +484,65 @@ async fn tx_disconnect_blocks() {
         .batch_execute("DROP TABLE p5_tx_probe;")
         .await
         .expect("drop tx probe");
+    drop(probe);
+    drop(parts.5);
+}
+
+#[tokio::test]
+async fn tx_disconnect_commit_path() {
+    let Some(parts) = pg_params().await else {
+        eprintln!("SKIP: no TEST_PG_URL and Docker not available");
+        return;
+    };
+    let setup = setup_client(&parts).await;
+    setup
+        .client
+        .batch_execute("DROP TABLE IF EXISTS p5_tx_commit; CREATE TABLE p5_tx_commit (id int4);")
+        .await
+        .expect("create tx table");
+    drop(setup);
+
+    let h = launch(&parts).await;
+    exec_ok(&h, "txc", "BEGIN").await;
+    exec_ok(&h, "txc", "INSERT INTO p5_tx_commit VALUES (42)").await;
+    h.cmd_tx
+        .send(AppCommand::Disconnect { id: h.conn_id })
+        .expect("send Disconnect");
+    let decision = wait_for(&h.event_rx, Duration::from_secs(5), |ev| {
+        matches!(ev, AppEvent::DisconnectRequiresDecision { .. })
+    })
+    .await;
+    assert!(decision.is_some(), "open txn must require a decision");
+
+    // Commit + disconnect: row survives on a fresh session.
+    h.cmd_tx
+        .send(AppCommand::ResolveTransaction {
+            id: h.conn_id,
+            commit: true,
+        })
+        .expect("send ResolveTransaction");
+    let down = wait_for(&h.event_rx, Duration::from_secs(5), |ev| {
+        matches!(
+            ev,
+            AppEvent::ConnectionStateChanged { state, .. } if state == "disconnected"
+        )
+    })
+    .await;
+    assert!(down.is_some(), "commit must disconnect");
+
+    let probe = setup_client(&parts).await;
+    let n: i64 = probe
+        .client
+        .query("SELECT count(*) AS n FROM p5_tx_commit", &[])
+        .await
+        .expect("probe count")[0]
+        .get("n");
+    assert_eq!(n, 1, "committed row must be visible after dialog commit");
+    probe
+        .client
+        .batch_execute("DROP TABLE p5_tx_commit;")
+        .await
+        .expect("drop tx table");
     drop(probe);
     drop(parts.5);
 }

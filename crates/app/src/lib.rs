@@ -41,6 +41,14 @@ pub enum AppCommand {
     Disconnect {
         id: ConnectionId,
     },
+    /// Resolve an open transaction, then disconnect (§22).
+    /// Sent from the disconnect-decision dialog: `commit` runs `COMMIT`,
+    /// otherwise `ROLLBACK`. Both clear the tracked tx state; a failed
+    /// `COMMIT` keeps the session alive so the user can retry.
+    ResolveTransaction {
+        id: ConnectionId,
+        commit: bool,
+    },
     Execute {
         tab: String,
         sql: String,
@@ -480,6 +488,10 @@ pub struct PgnativeApp {
     pub active_connection: Option<ConnectionId>,
     /// Most recent streaming query — Esc/Cancel and Export target this.
     pub active_query: Option<QueryId>,
+    /// Connection with an open txn awaiting a commit/rollback/keep-open
+    /// decision (§22). Set by `DisconnectRequiresDecision`, cleared when the
+    /// connection reports `disconnected` or the user keeps it open.
+    pub pending_disconnect: Option<ConnectionId>,
     /// Last successfully finished query — Export stays available after the
     /// stream completes (store still holds its buffered rows until next Execute).
     pub last_completed_query: Option<QueryId>,
@@ -566,6 +578,7 @@ impl PgnativeApp {
             connect_error: None,
             active_connection: None,
             active_query: None,
+            pending_disconnect: None,
             last_completed_query: None,
             export_status: None,
             store,
@@ -586,6 +599,14 @@ impl PgnativeApp {
                     if state == "connected" {
                         self.connect_error = None;
                         self.active_connection = Some(id);
+                    }
+                    if state == "disconnected" {
+                        if self.active_connection == Some(id) {
+                            self.active_connection = None;
+                        }
+                        if self.pending_disconnect == Some(id) {
+                            self.pending_disconnect = None;
+                        }
                     }
                     tracing::info!(state = %state, "connection state");
                 }
@@ -610,7 +631,7 @@ impl PgnativeApp {
                     }
                 }
                 AppEvent::DisconnectRequiresDecision { id } => {
-                    tracing::warn!(%id, "disconnect requires decision — active tx");
+                    self.pending_disconnect = Some(id);
                 }
                 AppEvent::PreferencesRestored { ui_state } => {
                     self.ui_state = ui_state;
@@ -997,9 +1018,43 @@ impl eframe::App for PgnativeApp {
                             }
                         }
                     }
+                    if let Some(id) = self.active_connection {
+                        if ui.button("Disconnect").clicked() {
+                            self.controller.send_command(AppCommand::Disconnect { id });
+                        }
+                    }
                 });
             });
         });
+
+        // Disconnect decision dialog (§22): an open txn blocks teardown until
+        // the user commits, rolls back, or keeps the connection open.
+        if let Some(id) = self.pending_disconnect {
+            egui::Window::new("Transaction active")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        "This connection has an open transaction.\n\
+                         Disconnecting must commit it, roll it back, or wait.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Commit + disconnect").clicked() {
+                            self.controller
+                                .send_command(AppCommand::ResolveTransaction { id, commit: true });
+                        }
+                        if ui.button("Rollback + disconnect").clicked() {
+                            self.controller
+                                .send_command(AppCommand::ResolveTransaction { id, commit: false });
+                        }
+                        if ui.button("Keep open").clicked() {
+                            // UI-local: the session is untouched, just dismiss.
+                            self.pending_disconnect = None;
+                        }
+                    });
+                });
+        }
 
         // Repaint when streaming results
         ctx.request_repaint_after(std::time::Duration::from_millis(100));

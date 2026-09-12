@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pgnative_db::connection::{connect_live, LiveSession};
-use pgnative_db::connection::{ConnectionConfig, ConnectionId, QueryId, SslMode};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, QueryId, SslMode, TxState};
 use pgnative_results::store::SharedStore;
 
 use crate::{AppCommand, AppEvent, AppState};
@@ -17,6 +17,44 @@ struct QueryEntry {
     ssl_mode: SslMode,
     ssl_root_cert: Option<String>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// Shared teardown for `Disconnect` and `ResolveTransaction` (§22).
+/// Aborts the driver, drops session + queries, clears tracked tx state,
+/// and notifies the UI. Never commits: any open txn is rolled back by close.
+fn teardown_connection(
+    id: ConnectionId,
+    sessions: &mut SessionMap,
+    queries: &Arc<parking_lot::Mutex<HashMap<QueryId, QueryEntry>>>,
+    state: &Arc<parking_lot::RwLock<AppState>>,
+    event_tx: &crossbeam_channel::Sender<AppEvent>,
+) {
+    if let Some(mut sess) = sessions.remove(&id) {
+        sess.abort_driver();
+    }
+    {
+        let mut s = state.write();
+        s.connections.remove(&id);
+        s.tx.remove(&id);
+    }
+    let _ = event_tx.try_send(AppEvent::ConnectionStateChanged {
+        id,
+        state: "disconnected".into(),
+    });
+    // Abort and clean up any queries still tied to this connection
+    {
+        let mut qs = queries.lock();
+        let to_abort: Vec<QueryId> = qs
+            .iter()
+            .filter(|(_, e)| e.connection == id)
+            .map(|(k, _)| *k)
+            .collect();
+        for qid in to_abort {
+            if let Some(e) = qs.remove(&qid) {
+                e.handle.abort();
+            }
+        }
+    }
 }
 
 pub fn spawn_runtime(
@@ -181,32 +219,45 @@ pub fn spawn_runtime(
                     }
                 }
                 AppCommand::Disconnect { id } => {
-                    // §22: surface the decision hook before tearing down. We still
-                    // disconnect (PG rolls back the open txn on close — we never
-                    // commit), but the event lets the UI warn instead of staying silent.
+                    // §22: an open txn blocks teardown. Emit the decision hook
+                    // and keep the session alive — the dialog answers via
+                    // `ResolveTransaction`. PG would roll back on close, so we
+                    // must not tear down before the user decides.
                     if state.read().disconnect_requires_decision(id) {
                         let _ = event_tx.try_send(AppEvent::DisconnectRequiresDecision { id });
+                        continue;
                     }
-                    if let Some(mut sess) = sessions.remove(&id) {
-                        sess.abort_driver();
-                    }
-                    state.write().connections.remove(&id);
-                    let _ = event_tx.try_send(AppEvent::ConnectionStateChanged {
-                        id,
-                        state: "disconnected".into(),
-                    });
-                    // Abort and clean up any queries still tied to this connection
-                    {
-                        let mut qs = queries.lock();
-                        let to_abort: Vec<QueryId> = qs
-                            .iter()
-                            .filter(|(_, e)| e.connection == id)
-                            .map(|(k, _)| *k)
-                            .collect();
-                        for qid in to_abort {
-                            if let Some(e) = qs.remove(&qid) {
-                                e.handle.abort();
-                            }
+                    teardown_connection(id, &mut sessions, &queries, &state, &event_tx);
+                }
+                AppCommand::ResolveTransaction { id, commit } => {
+                    let verb = if commit { "COMMIT" } else { "ROLLBACK" };
+                    let outcome = match sessions.get(&id) {
+                        None => None,
+                        Some(sess) => Some(sess.client.simple_query(verb).await.map(|_| ())),
+                    };
+                    match outcome {
+                        // Session already gone: nothing to resolve.
+                        None => {}
+                        Some(Ok(())) => {
+                            state.write().set_tx(id, TxState::Idle);
+                            teardown_connection(id, &mut sessions, &queries, &state, &event_tx);
+                        }
+                        Some(Err(e)) if commit => {
+                            // Failed COMMIT keeps the session: the txn may still
+                            // be live and the user can retry or roll back.
+                            let _ = event_tx.try_send(AppEvent::Error {
+                                op: "commit".into(),
+                                message: e.to_string(),
+                            });
+                        }
+                        Some(Err(e)) => {
+                            // Failed ROLLBACK: session state is suspect, so tear
+                            // down (close rolls back server-side). Never commit.
+                            let _ = event_tx.try_send(AppEvent::Error {
+                                op: "rollback".into(),
+                                message: e.to_string(),
+                            });
+                            teardown_connection(id, &mut sessions, &queries, &state, &event_tx);
                         }
                     }
                 }
