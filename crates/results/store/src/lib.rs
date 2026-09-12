@@ -37,6 +37,7 @@ pub struct ResultStore {
     total_pushed: u64,
     state: StoreState,
     config: StoreConfig,
+    columns: Vec<String>,
 }
 
 impl ResultStore {
@@ -48,6 +49,7 @@ impl ResultStore {
             total_pushed: 0,
             state: StoreState::Streaming,
             config,
+            columns: Vec::new(),
         }
     }
 
@@ -77,6 +79,29 @@ impl ResultStore {
         self.state = StoreState::Complete {
             total: self.total_pushed,
         };
+    }
+
+    /// Reset for a new query: drop rows, columns, budgets, back to Streaming.
+    /// Called once per `Execute` before the first batch arrives so Q2 never
+    /// shows Q1's rows/headers.
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.columns.clear();
+        self.byte_used = 0;
+        self.total_pushed = 0;
+        self.state = StoreState::Streaming;
+    }
+
+    /// Record column headers from the stream's first `Meta` event.
+    pub fn set_columns(&mut self, columns: Vec<String>) {
+        self.columns = columns;
+    }
+
+    /// Column headers snapshot — clone under the caller's read lock so the
+    /// header and rows render from one consistent lock acquisition.
+    #[must_use]
+    pub fn columns(&self) -> Vec<String> {
+        self.columns.clone()
     }
 
     pub fn cancel(&mut self) {
@@ -193,5 +218,28 @@ mod tests {
         });
         s.push_batch(vec![row_with_text(60), row_with_text(60)]);
         assert_eq!(s.len(), 1); // second evicts first
+    }
+
+    #[test]
+    fn clear_resets_rows_columns_and_budgets() {
+        let mut s = ResultStore::new(StoreConfig::default());
+        s.set_columns(vec!["id".to_string(), "txt".to_string()]);
+        s.push_batch(vec![row_with_text(10), row_with_text(10)]);
+        s.complete();
+        s.clear();
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert!(s.columns().is_empty());
+        assert_eq!(s.total_pushed(), 0);
+        assert_eq!(s.byte_used(), 0);
+        assert_eq!(s.state(), StoreState::Streaming);
+    }
+
+    #[test]
+    fn columns_roundtrip() {
+        let mut s = ResultStore::new(StoreConfig::default());
+        assert!(s.columns().is_empty());
+        s.set_columns(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(s.columns(), vec!["a".to_string(), "b".to_string()]);
     }
 }

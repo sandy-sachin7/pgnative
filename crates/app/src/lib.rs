@@ -469,6 +469,11 @@ pub struct PgnativeApp {
     pub connection_form: pgnative_ui_connections::ConnectionForm,
     /// Last connection error, shown inline in the connections panel.
     pub connect_error: Option<String>,
+    /// Connection that Run/Refresh target — set on successful connect, never
+    /// guessed from `HashMap` iteration order.
+    pub active_connection: Option<ConnectionId>,
+    /// Most recent streaming query — Esc/Cancel and Export target this.
+    pub active_query: Option<QueryId>,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
     completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
@@ -535,6 +540,8 @@ impl PgnativeApp {
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
             connect_error: None,
+            active_connection: None,
+            active_query: None,
             store,
             completion_cache: None,
             completion_schema_ptr: None,
@@ -549,9 +556,10 @@ impl PgnativeApp {
                 AppEvent::SchemaUpdated { model, .. } => {
                     self.schema = Some(model);
                 }
-                AppEvent::ConnectionStateChanged { state, .. } => {
+                AppEvent::ConnectionStateChanged { id, state } => {
                     if state == "connected" {
                         self.connect_error = None;
+                        self.active_connection = Some(id);
                     }
                     tracing::info!(state = %state, "connection state");
                 }
@@ -581,6 +589,14 @@ impl PgnativeApp {
                 AppEvent::HistoryResults { results } => {
                     self.history_results = results;
                 }
+                AppEvent::QueryProgress { query_id, .. } => {
+                    self.active_query = Some(query_id);
+                }
+                AppEvent::QueryFinished { query_id, .. } => {
+                    if self.active_query == Some(query_id) {
+                        self.active_query = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -594,15 +610,7 @@ impl PgnativeApp {
         if exec {
             if let Some(tab_id) = self.active_tab.clone() {
                 if let Some(tab) = self.editor_tabs.get(&tab_id) {
-                    if let Some(conn_id) = self
-                        .controller
-                        .state
-                        .read()
-                        .connections
-                        .keys()
-                        .next()
-                        .copied()
-                    {
+                    if let Some(conn_id) = self.active_connection {
                         self.controller.send_command(AppCommand::Execute {
                             tab: tab.id.clone(),
                             sql: tab.content.clone(),
@@ -614,7 +622,7 @@ impl PgnativeApp {
         }
         // Esc → cancel last query
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+            if let Some(qid) = self.active_query {
                 self.controller
                     .send_command(AppCommand::Cancel { query_id: qid });
             }
@@ -872,9 +880,7 @@ impl eframe::App for PgnativeApp {
                         }
                         if ui.button("Cancel (Esc)").clicked() {
                             // Cancel last query if any
-                            if let Some(qid) =
-                                self.controller.state.read().queries.keys().next().copied()
-                            {
+                            if let Some(qid) = self.active_query {
                                 self.controller
                                     .send_command(AppCommand::Cancel { query_id: qid });
                             }
@@ -885,12 +891,20 @@ impl eframe::App for PgnativeApp {
 
             ui.separator();
 
-            // Virtualized results — only visible + overscan rows (§18)
+            // Virtualized results — only visible + overscan rows (§18).
+            // Size the snapshot window from the available height so the
+            // scrolled-to rows are actually resident; the grid reports back
+            // the visible range for the next frame (see show_results).
+            let visible =
+                (ui.available_height() / self.viewport.row_height).ceil().max(1.0) as usize;
+            self.viewport.len = visible + 2 * self.viewport.overscan;
             let store_guard = self.store.read();
+            // Columns + rows under one read lock so header and body agree.
+            let columns = store_guard.columns();
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
             // Show via ui/results helper (ScrollArea::show_rows internally)
-            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &[]);
+            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &columns);
             ui.label(format!(
                 "rows: {} total (state: {:?})",
                 snap.rows.len(),
@@ -900,7 +914,7 @@ impl eframe::App for PgnativeApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Export:").weak().small());
                 if ui.small_button("CSV").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                    if let Some(qid) = self.active_query {
                         self.controller.send_command(AppCommand::Export {
                             query_id: qid,
                             format: ExportFormat::Csv,
@@ -908,7 +922,7 @@ impl eframe::App for PgnativeApp {
                     }
                 }
                 if ui.small_button("JSON").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                    if let Some(qid) = self.active_query {
                         self.controller.send_command(AppCommand::Export {
                             query_id: qid,
                             format: ExportFormat::Json,
@@ -916,7 +930,7 @@ impl eframe::App for PgnativeApp {
                     }
                 }
                 if ui.small_button("SQL").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                    if let Some(qid) = self.active_query {
                         self.controller.send_command(AppCommand::Export {
                             query_id: qid,
                             format: ExportFormat::SqlInsert,
