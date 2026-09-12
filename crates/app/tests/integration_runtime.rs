@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pgnative_app::{AppCommand, AppEvent, AppState};
+use pgnative_app::{AppCommand, AppEvent, AppState, ExportFormat};
 use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
 use pgnative_results_store::{ResultStore, SharedStore, StoreConfig};
 use secrecy::SecretString;
@@ -262,6 +262,45 @@ async fn runtime_connect_execute_cancel_via_appcommand() {
             g.len()
         );
     }
+
+    // 3b) Minimal CSV export (§28): buffered fixture rows → temp file.
+    let fixture_qid = match &finished2 {
+        Some(AppEvent::QueryFinished { query_id, .. }) => *query_id,
+        _ => panic!("fixture QueryFinished should carry a query id"),
+    };
+    cmd_tx
+        .send(AppCommand::Export {
+            query_id: fixture_qid,
+            format: ExportFormat::Csv,
+        })
+        .expect("send Export CSV");
+    let exported = wait_for(
+        &event_rx,
+        Duration::from_secs(10),
+        |ev| matches!(ev, AppEvent::ExportProgress { query_id, .. } if *query_id == fixture_qid),
+    )
+    .await;
+    let path = match exported {
+        Some(AppEvent::ExportProgress { written, path, .. }) => {
+            assert_eq!(written, 100, "export should report 100 buffered rows");
+            path
+        }
+        _ => panic!("CSV export should emit ExportProgress"),
+    };
+    let csv = std::fs::read_to_string(&path).expect("export file should exist");
+    let mut lines = csv.lines();
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "id,txt,flag",
+        "csv header should carry column names"
+    );
+    assert_eq!(
+        csv.lines().count(),
+        101,
+        "csv should hold header + 100 rows"
+    );
+    assert!(csv.contains("row-0"), "csv should contain fixture content");
+    std::fs::remove_file(&path).ok();
 
     // 4) Cancellation via AppCommand::Cancel — pg_sleep cancellable
     // Need the QueryId of the long query. Capture it via state or QueryProgress.

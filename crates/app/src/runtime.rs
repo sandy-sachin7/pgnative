@@ -506,9 +506,51 @@ pub fn spawn_runtime(
                     });
                 }
                 AppCommand::Export { query_id, format } => {
-                    let _ = event_tx.try_send(AppEvent::Error {
-                        op: "export".into(),
-                        message: format!("export {query_id} {format:?} not yet implemented"),
+                    // Minimal CSV export (§28): snapshot buffered rows (bounded
+                    // store, so this is the visible window — not the full
+                    // server-side result) and write one file. Blocking fs I/O
+                    // runs on spawn_blocking, off the dispatch loop.
+                    if !matches!(format, crate::ExportFormat::Csv) {
+                        let _ = event_tx.try_send(AppEvent::Error {
+                            op: "export".into(),
+                            message: "only CSV export is supported for now".into(),
+                        });
+                        return;
+                    }
+                    let ev_tx = event_tx.clone();
+                    let store_clone = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let (columns, rows) = {
+                            let guard = store_clone.read();
+                            (guard.columns(), guard.snapshot_range(0, guard.len()))
+                        };
+                        let csv = match pgnative_results_export::export_csv(&rows, &columns) {
+                            Ok(csv) => csv,
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "export".into(),
+                                    message: format!("csv encode failed: {e}"),
+                                });
+                                return;
+                            }
+                        };
+                        let path =
+                            std::env::temp_dir().join(format!("pgnative-export-{query_id}.csv"));
+                        match std::fs::write(&path, csv) {
+                            Ok(()) => {
+                                let _ = ev_tx.try_send(AppEvent::ExportProgress {
+                                    query_id,
+                                    written: rows.len() as u64,
+                                    path: path.display().to_string(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "export".into(),
+                                    message: format!("write {} failed: {e}", path.display()),
+                                });
+                            }
+                        }
                     });
                 }
             }

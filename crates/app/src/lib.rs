@@ -88,8 +88,12 @@ pub enum AppEvent {
         model: Arc<SchemaModel>,
     },
     ExportProgress {
+        /// Query whose buffered rows were written.
         query_id: QueryId,
+        /// Number of rows written.
         written: u64,
+        /// Destination file path.
+        path: String,
     },
     Error {
         op: String,
@@ -474,6 +478,11 @@ pub struct PgnativeApp {
     pub active_connection: Option<ConnectionId>,
     /// Most recent streaming query — Esc/Cancel and Export target this.
     pub active_query: Option<QueryId>,
+    /// Last successfully finished query — Export stays available after the
+    /// stream completes (store still holds its buffered rows until next Execute).
+    pub last_completed_query: Option<QueryId>,
+    /// Result of the last export (saved path or error), shown under results.
+    pub export_status: Option<String>,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
     completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
@@ -555,6 +564,8 @@ impl PgnativeApp {
             connect_error: None,
             active_connection: None,
             active_query: None,
+            last_completed_query: None,
+            export_status: None,
             store,
             completion_cache: None,
             completion_schema_ptr: None,
@@ -590,6 +601,9 @@ impl PgnativeApp {
                         if op == "connect" {
                             self.connect_error = Some(message.clone());
                         }
+                        if op == "export" {
+                            self.export_status = Some(message.clone());
+                        }
                         tracing::warn!(op = %op, message = %message, "app error");
                     }
                 }
@@ -604,11 +618,21 @@ impl PgnativeApp {
                 }
                 AppEvent::QueryProgress { query_id, .. } => {
                     self.active_query = Some(query_id);
+                    // A new stream invalidates the previous finished result.
+                    self.last_completed_query = None;
                 }
-                AppEvent::QueryFinished { query_id, .. } => {
+                AppEvent::QueryFinished {
+                    query_id, success, ..
+                } => {
                     if self.active_query == Some(query_id) {
                         self.active_query = None;
                     }
+                    if success {
+                        self.last_completed_query = Some(query_id);
+                    }
+                }
+                AppEvent::ExportProgress { written, path, .. } => {
+                    self.export_status = Some(format!("exported {written} rows → {path}"));
                 }
                 _ => {}
             }
@@ -932,32 +956,26 @@ impl eframe::App for PgnativeApp {
                 snap.rows.len(),
                 snap.state
             ));
-            // Export wiring placeholder (§28) — streams via runtime Export command
+            // Minimal CSV export (§28): buffered rows → temp-dir file via runtime.
+            // JSON/SQL formats stay unwired until demanded (no fake buttons).
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Export:").weak().small());
-                if ui.small_button("CSV").clicked() {
-                    if let Some(qid) = self.active_query {
+                let export_target = self.active_query.or(self.last_completed_query);
+                if ui
+                    .small_button("CSV")
+                    .on_hover_text("Save buffered rows as CSV")
+                    .clicked()
+                {
+                    if let Some(qid) = export_target {
+                        self.export_status = None;
                         self.controller.send_command(AppCommand::Export {
                             query_id: qid,
                             format: ExportFormat::Csv,
                         });
                     }
                 }
-                if ui.small_button("JSON").clicked() {
-                    if let Some(qid) = self.active_query {
-                        self.controller.send_command(AppCommand::Export {
-                            query_id: qid,
-                            format: ExportFormat::Json,
-                        });
-                    }
-                }
-                if ui.small_button("SQL").clicked() {
-                    if let Some(qid) = self.active_query {
-                        self.controller.send_command(AppCommand::Export {
-                            query_id: qid,
-                            format: ExportFormat::SqlInsert,
-                        });
-                    }
+                if let Some(status) = &self.export_status {
+                    ui.label(egui::RichText::new(status).weak().small());
                 }
             });
         });
