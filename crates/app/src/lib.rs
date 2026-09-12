@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, ConnectionState, QueryId, TxState};
+use pgnative_db_connection::{
+    parse_connection_url, ssl_mode_from_str, ConnectionConfig, ConnectionId, ConnectionState,
+    QueryId, TxState,
+};
 use pgnative_schema_model::SchemaModel;
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -337,6 +340,91 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
 // Keyring integration (§24) — non-secret in SQLite, secret in OS keychain
 // ---------------------------------------------------------------------------
 
+/// Build a [`ConnectionConfig`] + password from the connection form.
+///
+/// URL-first: when `form.url` is non-empty it is parsed via
+/// [`parse_connection_url`]; an explicitly typed password overrides the one
+/// embedded in the URL. Otherwise the individual host/port/db/user fields are
+/// used with the typed password. Never logs secrets.
+fn build_connection_from_form(
+    form: &pgnative_ui_connections::ConnectionForm,
+) -> Result<(ConnectionConfig, Option<SecretString>), String> {
+    if !form.url.trim().is_empty() {
+        let (mut cfg, url_pw) = parse_connection_url(&form.url)?;
+        if !form.password.is_empty() {
+            return Ok((cfg, Some(SecretString::new(form.password.clone().into()))));
+        }
+        if !form.name.trim().is_empty() {
+            cfg.name = form.name.trim().to_string();
+        }
+        return Ok((cfg, url_pw));
+    }
+    if form.dbname.trim().is_empty() {
+        return Err("database is required (or paste a connection URL)".to_string());
+    }
+    let name = if form.name.trim().is_empty() {
+        if form.username.trim().is_empty() {
+            format!("{}/{}", form.host.trim(), form.dbname.trim())
+        } else {
+            format!(
+                "{}@{}/{}",
+                form.username.trim(),
+                form.host.trim(),
+                form.dbname.trim()
+            )
+        }
+    } else {
+        form.name.trim().to_string()
+    };
+    let password = if form.password.is_empty() {
+        None
+    } else {
+        Some(SecretString::new(form.password.clone().into()))
+    };
+    Ok((
+        ConnectionConfig {
+            id: ConnectionId(Uuid::new_v4()),
+            name,
+            host: form.host.trim().to_string(),
+            port: form.port,
+            dbname: form.dbname.trim().to_string(),
+            username: form.username.trim().to_string(),
+            ssl_mode: ssl_mode_from_str(&form.ssl_mode),
+            ssl_root_cert: None,
+            ssh_tunnel: None,
+        },
+        password,
+    ))
+}
+
+/// Persist a connection's non-secret config to SQLite and its password to the
+/// OS keychain (best-effort: keychain failures are logged, never fatal, and
+/// never fall back to plaintext storage per §24).
+fn persist_connection(cfg: &ConnectionConfig, password: Option<&SecretString>) {
+    let saved = pgnative_storage_connections::SavedConnection {
+        id: cfg.id.0.to_string(),
+        name: cfg.name.clone(),
+        host: cfg.host.clone(),
+        port: cfg.port,
+        dbname: cfg.dbname.clone(),
+        username: cfg.username.clone(),
+        ssl_mode: cfg.ssl_mode.to_string(),
+    };
+    match open_app_db(&app_db_path()) {
+        Ok(conn) => {
+            if let Err(e) = pgnative_storage_connections::upsert(&conn, &saved) {
+                tracing::warn!("persist connection: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("persist connection (open db): {e}"),
+    }
+    if let Some(pw) = password {
+        if let Err(e) = store_password(cfg.id, pw.clone()) {
+            tracing::warn!("persist connection (keychain unavailable): {e}");
+        }
+    }
+}
+///
 /// Resolve password for a connection from the OS keychain.
 ///
 /// Returns `None` if absent (caller should prompt), never logs the secret.
@@ -379,6 +467,8 @@ pub struct PgnativeApp {
     pub history_query: String,
     pub history_results: Vec<String>,
     pub connection_form: pgnative_ui_connections::ConnectionForm,
+    /// Last connection error, shown inline in the connections panel.
+    pub connect_error: Option<String>,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
     completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
@@ -444,6 +534,7 @@ impl PgnativeApp {
             history_query: String::new(),
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
+            connect_error: None,
             store,
             completion_cache: None,
             completion_schema_ptr: None,
@@ -459,6 +550,9 @@ impl PgnativeApp {
                     self.schema = Some(model);
                 }
                 AppEvent::ConnectionStateChanged { state, .. } => {
+                    if state == "connected" {
+                        self.connect_error = None;
+                    }
                     tracing::info!(state = %state, "connection state");
                 }
                 AppEvent::Error { op, message } => {
@@ -472,6 +566,9 @@ impl PgnativeApp {
                                 message.split("\n---\n").map(|s| s.to_string()).collect();
                         }
                     } else {
+                        if op == "connect" {
+                            self.connect_error = Some(message.clone());
+                        }
                         tracing::warn!(op = %op, message = %message, "app error");
                     }
                 }
@@ -833,10 +930,24 @@ impl eframe::App for PgnativeApp {
         egui::Panel::bottom("connections").show(ui, |ui| {
             ui.collapsing("Connections", |ui| {
                 pgnative_ui_connections::show_connections(ui, &mut self.connection_form);
+                if let Some(err) = &self.connect_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() {
-                        let id = ConnectionId(Uuid::new_v4());
-                        self.controller.send_command(AppCommand::Connect { id });
+                        match build_connection_from_form(&self.connection_form) {
+                            Ok((cfg, password)) => {
+                                self.connect_error = None;
+                                persist_connection(&cfg, password.as_ref());
+                                self.controller.send_command(AppCommand::ConnectDirect {
+                                    config: cfg,
+                                    password,
+                                });
+                            }
+                            Err(e) => {
+                                self.connect_error = Some(e);
+                            }
+                        }
                     }
                 });
             });
@@ -884,6 +995,46 @@ mod tests {
         assert!(!s.disconnect_requires_decision(id));
         s.set_tx(id, TxState::InFailedTransaction);
         assert!(s.disconnect_requires_decision(id));
+    }
+
+    #[test]
+    fn build_connection_prefers_url() {
+        let form = pgnative_ui_connections::ConnectionForm {
+            url: "postgres://bob:pw@db.example:5433/mydb?sslmode=require".into(),
+            password: String::new(),
+            ..Default::default()
+        };
+        let (cfg, pw) = build_connection_from_form(&form).unwrap();
+        assert_eq!(cfg.host, "db.example");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "mydb");
+        assert_eq!(cfg.username, "bob");
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn build_connection_manual_fields() {
+        let form = pgnative_ui_connections::ConnectionForm {
+            url: String::new(),
+            password: "s3cret".into(),
+            host: "127.0.0.1".into(),
+            port: 5432,
+            dbname: "app".into(),
+            username: "ann".into(),
+            ssl_mode: "disable".into(),
+            name: String::new(),
+        };
+        let (cfg, pw) = build_connection_from_form(&form).unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.dbname, "app");
+        assert_eq!(cfg.ssl_mode, pgnative_db_connection::SslMode::Disable);
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn build_connection_rejects_empty() {
+        let form = pgnative_ui_connections::ConnectionForm::default();
+        assert!(build_connection_from_form(&form).is_err());
     }
 
     #[test]

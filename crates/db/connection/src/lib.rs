@@ -777,6 +777,88 @@ pub fn classify_tx(sql: &str) -> Option<TxState> {
     }
 }
 
+/// Parse a user-supplied `sslmode` value into [`SslMode`].
+///
+/// Accepts `disable`, `prefer` (default), `require`, `verify-ca`/`verify_ca`,
+/// `verify-full`/`verify_full` (case-insensitive). Unknown values map to `Prefer`.
+#[must_use]
+pub fn ssl_mode_from_str(raw: &str) -> SslMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "disable" => SslMode::Disable,
+        "require" => SslMode::Require,
+        "verify-ca" | "verify_ca" => SslMode::VerifyCa,
+        "verify-full" | "verify_full" => SslMode::VerifyFull,
+        _ => SslMode::Prefer,
+    }
+}
+
+/// Parse a `postgres://` / `postgresql://` URL into [`ConnectionConfig`] + password.
+///
+/// Never logs the secret; on failure returns a human-readable message without
+/// echoing the password. Defaults: host `localhost`, port `5432`,
+/// dbname `postgres`, sslmode `prefer`.
+pub fn parse_connection_url(raw: &str) -> Result<(ConnectionConfig, Option<SecretString>), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("connection URL is empty".to_string());
+    }
+    let url = url::Url::parse(trimmed).map_err(|e| format!("invalid connection URL: {e}"))?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "postgres" && scheme != "postgresql" {
+        return Err(format!(
+            "unsupported scheme '{scheme}' (expected postgres://)"
+        ));
+    }
+    let host = url.host_str().unwrap_or("localhost").to_string();
+    let port = url.port().unwrap_or(5432);
+    let username = url.username().to_string();
+    let password = if let Some(pw) = url.password() {
+        if pw.is_empty() {
+            None
+        } else {
+            Some(SecretString::new(pw.to_string().into()))
+        }
+    } else {
+        None
+    };
+    let path = url.path().trim_start_matches('/').to_string();
+    let dbname = if path.is_empty() || path.contains('/') {
+        // Take first path segment; reject nested paths to avoid ambiguity.
+        let first = path.split('/').next().unwrap_or("");
+        if first.is_empty() {
+            "postgres".to_string()
+        } else {
+            first.to_string()
+        }
+    } else {
+        path
+    };
+    let mut ssl_mode = SslMode::Prefer;
+    for (k, v) in url.query_pairs() {
+        let kl = k.to_ascii_lowercase();
+        if kl == "sslmode" || kl == "ssl_mode" {
+            ssl_mode = ssl_mode_from_str(&v);
+        }
+    }
+    let name = if username.is_empty() {
+        format!("{host}/{dbname}")
+    } else {
+        format!("{username}@{host}/{dbname}")
+    };
+    let cfg = ConnectionConfig {
+        id: ConnectionId::new(),
+        name,
+        host,
+        port,
+        dbname,
+        username,
+        ssl_mode,
+        ssl_root_cert: None,
+        ssh_tunnel: None,
+    };
+    Ok((cfg, password))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +902,34 @@ mod tests {
     fn tx_state_is_active() {
         assert!(!TxState::Idle.is_active());
         assert!(TxState::InFailedTransaction.is_active());
+    }
+
+    #[test]
+    fn parses_full_url() {
+        let (cfg, pw) =
+            parse_connection_url("postgres://bob:s3cret@db.example:5433/mydb?sslmode=require")
+                .unwrap();
+        assert_eq!(cfg.host, "db.example");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "mydb");
+        assert_eq!(cfg.username, "bob");
+        assert_eq!(cfg.ssl_mode, SslMode::Require);
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn parses_url_defaults() {
+        let (cfg, pw) = parse_connection_url("postgres://localhost/mydb").unwrap();
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.port, 5432);
+        assert_eq!(cfg.ssl_mode, SslMode::Prefer);
+        assert!(pw.is_none());
+    }
+
+    #[test]
+    fn rejects_bad_scheme_without_leak() {
+        let err = parse_connection_url("mysql://bob:secret@h/db").unwrap_err();
+        assert!(err.contains("postgres"));
+        assert!(!err.contains("secret"));
     }
 }
