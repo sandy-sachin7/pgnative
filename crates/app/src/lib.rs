@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
-use pgnative_db_connection::{
+use pgnative_db::connection::{
     parse_connection_url, ssl_mode_from_str, ConnectionConfig, ConnectionId, ConnectionState,
     QueryId, TxState,
 };
-use pgnative_schema_model::SchemaModel;
+use pgnative_schema::model::SchemaModel;
 use secrecy::SecretString;
 use uuid::Uuid;
 
@@ -103,7 +103,7 @@ pub enum AppEvent {
         id: ConnectionId,
     },
     PreferencesRestored {
-        ui_state: pgnative_ui_layout::UiState,
+        ui_state: crate::ui::layout::UiState,
     },
     HistoryResults {
         results: Vec<String>,
@@ -112,7 +112,7 @@ pub enum AppEvent {
 
 /// Domain state — AppState (§54), separate from UiState.
 ///
-/// NOTE: `schema` duplicates `pgnative_schema_cache::SchemaCache` state.
+/// NOTE: `schema` duplicates `pgnative_schema::cache::SchemaCache` state.
 /// `SchemaCache` is the canonical TTL/epoch store (hot, epoch increments on
 /// every `set_ready*`). `AppState::schema` is kept in sync via
 /// `SchemaUpdated` events and should eventually be replaced by a shared
@@ -154,6 +154,8 @@ impl AppState {
 }
 
 pub mod runtime;
+/// egui view layer (pure rendering, no SQL/I/O).
+pub mod ui;
 
 /// Controller — owns channels + optional Tokio JoinSet drain.
 ///
@@ -266,18 +268,18 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         conn.execute("BEGIN", [])?;
         let res: Result<(), rusqlite::Error> = (|| {
             // v1: baseline tables from storage crates
-            pgnative_storage_connections::init(conn).map_err(|e| match e {
-                pgnative_storage_connections::StoreError::Rusqlite(inner) => inner,
+            pgnative_storage::connections::init(conn).map_err(|e| match e {
+                pgnative_storage::connections::StoreError::Rusqlite(inner) => inner,
             })?;
-            pgnative_storage_history::init(conn).map_err(|e| match e {
-                pgnative_storage_history::HistoryError::Rusqlite(inner) => inner,
+            pgnative_storage::history::init(conn).map_err(|e| match e {
+                pgnative_storage::history::HistoryError::Rusqlite(inner) => inner,
             })?;
-            pgnative_storage_editor_state::init(conn).map_err(|e| match e {
-                pgnative_storage_editor_state::EditorError::Rusqlite(inner) => inner,
+            pgnative_storage::editor_state::init(conn).map_err(|e| match e {
+                pgnative_storage::editor_state::EditorError::Rusqlite(inner) => inner,
             })?;
-            pgnative_storage_preferences::init(conn).map_err(|e| match e {
-                pgnative_storage_preferences::PrefError::Rusqlite(inner) => inner,
-                pgnative_storage_preferences::PrefError::Json(_) => {
+            pgnative_storage::preferences::init(conn).map_err(|e| match e {
+                pgnative_storage::preferences::PrefError::Rusqlite(inner) => inner,
+                pgnative_storage::preferences::PrefError::Json(_) => {
                     rusqlite::Error::InvalidParameterName("json".into())
                 }
             })?;
@@ -351,7 +353,7 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
 /// embedded in the URL. Otherwise the individual host/port/db/user fields are
 /// used with the typed password. Never logs secrets.
 fn build_connection_from_form(
-    form: &pgnative_ui_connections::ConnectionForm,
+    form: &crate::ui::connections::ConnectionForm,
 ) -> Result<(ConnectionConfig, Option<SecretString>), String> {
     if !form.url.trim().is_empty() {
         let (mut cfg, url_pw) = parse_connection_url(&form.url)?;
@@ -405,7 +407,7 @@ fn build_connection_from_form(
 /// OS keychain (best-effort: keychain failures are logged, never fatal, and
 /// never fall back to plaintext storage per §24).
 fn persist_connection(cfg: &ConnectionConfig, password: Option<&SecretString>) {
-    let saved = pgnative_storage_connections::SavedConnection {
+    let saved = pgnative_storage::connections::SavedConnection {
         id: cfg.id.0.to_string(),
         name: cfg.name.clone(),
         host: cfg.host.clone(),
@@ -416,7 +418,7 @@ fn persist_connection(cfg: &ConnectionConfig, password: Option<&SecretString>) {
     };
     match open_app_db(&app_db_path()) {
         Ok(conn) => {
-            if let Err(e) = pgnative_storage_connections::upsert(&conn, &saved) {
+            if let Err(e) = pgnative_storage::connections::upsert(&conn, &saved) {
                 tracing::warn!("persist connection: {e}");
             }
         }
@@ -432,23 +434,23 @@ fn persist_connection(cfg: &ConnectionConfig, password: Option<&SecretString>) {
 /// Resolve password for a connection from the OS keychain.
 ///
 /// Returns `None` if absent (caller should prompt), never logs the secret.
-/// Wraps `pgnative_storage_keychain::get_password` with sanitized error mapping.
+/// Wraps `pgnative_storage::keychain::get_password` with sanitized error mapping.
 #[must_use]
 pub fn resolve_password(id: ConnectionId) -> Option<secrecy::SecretString> {
-    pgnative_storage_keychain::get_password(id.0).ok()
+    pgnative_storage::keychain::get_password(id.0).ok()
 }
 
 /// Persist password to OS keychain.
 pub fn store_password(
     id: ConnectionId,
     password: secrecy::SecretString,
-) -> Result<(), pgnative_storage_keychain::KeychainError> {
-    pgnative_storage_keychain::set_password(id.0, password)
+) -> Result<(), pgnative_storage::keychain::KeychainError> {
+    pgnative_storage::keychain::set_password(id.0, password)
 }
 
 /// Remove password from keychain on connection deletion.
-pub fn delete_password(id: ConnectionId) -> Result<(), pgnative_storage_keychain::KeychainError> {
-    pgnative_storage_keychain::delete_password(id.0)
+pub fn delete_password(id: ConnectionId) -> Result<(), pgnative_storage::keychain::KeychainError> {
+    pgnative_storage::keychain::delete_password(id.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -462,15 +464,15 @@ pub fn delete_password(id: ConnectionId) -> Result<(), pgnative_storage_keychain
 /// and renders from snapshot state per §30.
 pub struct PgnativeApp {
     pub controller: AppController,
-    pub ui_state: pgnative_ui_layout::UiState,
-    pub viewport: pgnative_results_viewport::ViewportState,
-    pub theme: pgnative_ui_theme::Theme,
+    pub ui_state: crate::ui::layout::UiState,
+    pub viewport: pgnative_results::viewport::ViewportState,
+    pub theme: crate::ui::theme::Theme,
     pub schema: Option<Arc<SchemaModel>>,
-    pub editor_tabs: HashMap<String, pgnative_ui_editor::EditorTab>,
+    pub editor_tabs: HashMap<String, crate::ui::editor::EditorTab>,
     pub active_tab: Option<String>,
     pub history_query: String,
     pub history_results: Vec<String>,
-    pub connection_form: pgnative_ui_connections::ConnectionForm,
+    pub connection_form: crate::ui::connections::ConnectionForm,
     /// Last connection error, shown inline in the connections panel.
     pub connect_error: Option<String>,
     /// Connection that Run/Refresh target — set on successful connect, never
@@ -484,9 +486,9 @@ pub struct PgnativeApp {
     /// Result of the last export (saved path or error), shown under results.
     pub export_status: Option<String>,
     /// Shared result store (populated by async execution layer).
-    pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
-    completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
-    completion_schema_ptr: Option<*const pgnative_schema_model::SchemaModel>,
+    pub store: Arc<parking_lot::RwLock<pgnative_results::store::ResultStore>>,
+    completion_cache: Option<Arc<pgnative_schema::completion::CompletionEngine>>,
+    completion_schema_ptr: Option<*const pgnative_schema::model::SchemaModel>,
     runtime_handle: Option<tokio::task::JoinHandle<()>>,
     last_editor_persist: std::time::Instant,
 }
@@ -495,15 +497,15 @@ impl PgnativeApp {
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Apply theme eagerly
-        let theme = pgnative_ui_theme::Theme::dark();
+        let theme = crate::ui::theme::Theme::dark();
         cc.egui_ctx.set_visuals(theme.visuals());
 
         // Restore UI state: default immediately; load persisted state off UI thread.
-        let ui_state = pgnative_ui_layout::UiState::default();
+        let ui_state = crate::ui::layout::UiState::default();
 
-        let store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>> = Arc::new(
-            parking_lot::RwLock::new(pgnative_results_store::ResultStore::new(
-                pgnative_results_store::StoreConfig::default(),
+        let store: Arc<parking_lot::RwLock<pgnative_results::store::ResultStore>> = Arc::new(
+            parking_lot::RwLock::new(pgnative_results::store::ResultStore::new(
+                pgnative_results::store::StoreConfig::default(),
             )),
         );
         let mut controller = AppController::new();
@@ -525,9 +527,9 @@ impl PgnativeApp {
             let ev_tx = event_tx;
             handle.spawn_blocking(move || {
                 if let Ok(conn) = open_app_db(&app_db_path()) {
-                    if let Ok(Some(v)) = pgnative_storage_preferences::get(&conn, "ui_state") {
+                    if let Ok(Some(v)) = pgnative_storage::preferences::get(&conn, "ui_state") {
                         if let Ok(restored) =
-                            serde_json::from_value::<pgnative_ui_layout::UiState>(v)
+                            serde_json::from_value::<crate::ui::layout::UiState>(v)
                         {
                             let _ = ev_tx
                                 .try_send(AppEvent::PreferencesRestored { ui_state: restored });
@@ -546,21 +548,21 @@ impl PgnativeApp {
         // First frame is usable immediately: one tab with a starter query
         // so the user can connect and hit Ctrl+Enter without setup.
         let mut editor_tabs = HashMap::new();
-        let mut first_tab = pgnative_ui_editor::EditorTab::new("tab-1");
+        let mut first_tab = crate::ui::editor::EditorTab::new("tab-1");
         first_tab.content = "-- Connect above, then Ctrl+Enter to run\nSELECT 1;".to_string();
         editor_tabs.insert("tab-1".to_string(), first_tab);
 
         Self {
             controller,
             ui_state,
-            viewport: pgnative_results_viewport::ViewportState::default(),
+            viewport: pgnative_results::viewport::ViewportState::default(),
             theme,
             schema: None,
             editor_tabs,
             active_tab: Some("tab-1".to_string()),
             history_query: String::new(),
             history_results: Vec::new(),
-            connection_form: pgnative_ui_connections::ConnectionForm::default(),
+            connection_form: crate::ui::connections::ConnectionForm::default(),
             connect_error: None,
             active_connection: None,
             active_query: None,
@@ -735,7 +737,7 @@ impl eframe::App for PgnativeApp {
                 if ui.button("New Tab").clicked() {
                     let id = format!("tab-{}", self.editor_tabs.len() + 1);
                     self.editor_tabs
-                        .insert(id.clone(), pgnative_ui_editor::EditorTab::new(id.clone()));
+                        .insert(id.clone(), crate::ui::editor::EditorTab::new(id.clone()));
                     self.active_tab = Some(id);
                     self.controller.send_command(AppCommand::HistorySearch {
                         query: String::new(),
@@ -751,9 +753,9 @@ impl eframe::App for PgnativeApp {
                     let label = if self.theme.is_dark { "Light" } else { "Dark" };
                     if ui.button(label).clicked() {
                         self.theme = if self.theme.is_dark {
-                            pgnative_ui_theme::Theme::light()
+                            crate::ui::theme::Theme::light()
                         } else {
-                            pgnative_ui_theme::Theme::dark()
+                            crate::ui::theme::Theme::dark()
                         };
                         ctx.set_visuals(self.theme.visuals());
                     }
@@ -770,7 +772,7 @@ impl eframe::App for PgnativeApp {
                 ui.heading("Explorer");
                 ui.text_edit_singleline(&mut self.ui_state.search);
                 let model_ref = schema_clone.as_deref();
-                pgnative_ui_explorer::show_explorer(ui, model_ref, &self.ui_state.search);
+                crate::ui::explorer::show_explorer(ui, model_ref, &self.ui_state.search);
             });
 
         // Right: history panel (FTS) — driven by HistorySearch command.
@@ -786,7 +788,7 @@ impl eframe::App for PgnativeApp {
                         query: self.history_query.clone(),
                     });
                 }
-                pgnative_ui_history_panel::show_history(
+                crate::ui::history_panel::show_history(
                     ui,
                     &self.history_query,
                     &self.history_results,
@@ -799,7 +801,7 @@ impl eframe::App for PgnativeApp {
                 None => {
                     let id = format!("tab-{}", self.editor_tabs.len() + 1);
                     self.editor_tabs
-                        .insert(id.clone(), pgnative_ui_editor::EditorTab::new(id.clone()));
+                        .insert(id.clone(), crate::ui::editor::EditorTab::new(id.clone()));
                     self.active_tab = Some(id.clone());
                     id
                 }
@@ -849,9 +851,9 @@ impl eframe::App for PgnativeApp {
                             let cursor_clone = tab.cursor;
                             let persist = move || {
                                 if let Ok(conn) = open_app_db(&app_db_path()) {
-                                    let _ = pgnative_storage_editor_state::upsert(
+                                    let _ = pgnative_storage::editor_state::upsert(
                                         &conn,
-                                        &pgnative_storage_editor_state::EditorTab {
+                                        &pgnative_storage::editor_state::EditorTab {
                                             tab_id: tab_id_clone,
                                             connection_id: None,
                                             content: content_clone,
@@ -871,13 +873,13 @@ impl eframe::App for PgnativeApp {
                     // Completion preview — cache engine per schema Arc ptr per §30.
                     if let Some(schema) = &self.schema {
                         let ptr = Arc::as_ptr(schema);
-                        let engine: Arc<pgnative_schema_completion::CompletionEngine> =
+                        let engine: Arc<pgnative_schema::completion::CompletionEngine> =
                             if self.completion_schema_ptr == Some(ptr) {
                                 if let Some(cached) = self.completion_cache.as_ref() {
                                     Arc::clone(cached)
                                 } else {
                                     let e = Arc::new(
-                                        pgnative_schema_completion::CompletionEngine::new(schema),
+                                        pgnative_schema::completion::CompletionEngine::new(schema),
                                     );
                                     self.completion_cache = Some(Arc::clone(&e));
                                     self.completion_schema_ptr = Some(ptr);
@@ -885,7 +887,7 @@ impl eframe::App for PgnativeApp {
                                 }
                             } else {
                                 let e = Arc::new(
-                                    pgnative_schema_completion::CompletionEngine::new(schema),
+                                    pgnative_schema::completion::CompletionEngine::new(schema),
                                 );
                                 self.completion_cache = Some(Arc::clone(&e));
                                 self.completion_schema_ptr = Some(ptr);
@@ -899,7 +901,7 @@ impl eframe::App for PgnativeApp {
                             .unwrap_or("")
                             .to_string();
                         if !prefix.is_empty() {
-                            let completions = pgnative_ui_editor::completions_for(&engine, &prefix);
+                            let completions = crate::ui::editor::completions_for(&engine, &prefix);
                             if !completions.is_empty() {
                                 ui.label(format!("completions: {}", completions.join(", ")));
                             }
@@ -942,7 +944,7 @@ impl eframe::App for PgnativeApp {
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
             // Show via ui/results helper (ScrollArea::show_rows internally)
-            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &columns);
+            crate::ui::results::show_results(ui, &mut self.viewport, &snap, &columns);
             ui.label(format!(
                 "rows: {} total (state: {:?})",
                 snap.rows.len(),
@@ -975,7 +977,7 @@ impl eframe::App for PgnativeApp {
         // Connections panel at bottom (collapsible)
         egui::Panel::bottom("connections").show(ui, |ui| {
             ui.collapsing("Connections", |ui| {
-                pgnative_ui_connections::show_connections(ui, &mut self.connection_form);
+                crate::ui::connections::show_connections(ui, &mut self.connection_form);
                 if let Some(err) = &self.connect_error {
                     ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
                 }
@@ -1045,7 +1047,7 @@ mod tests {
 
     #[test]
     fn build_connection_prefers_url() {
-        let form = pgnative_ui_connections::ConnectionForm {
+        let form = crate::ui::connections::ConnectionForm {
             url: "postgres://bob:pw@db.example:5433/mydb?sslmode=require".into(),
             password: String::new(),
             ..Default::default()
@@ -1060,7 +1062,7 @@ mod tests {
 
     #[test]
     fn build_connection_manual_fields() {
-        let form = pgnative_ui_connections::ConnectionForm {
+        let form = crate::ui::connections::ConnectionForm {
             url: String::new(),
             password: "s3cret".into(),
             host: "127.0.0.1".into(),
@@ -1073,13 +1075,13 @@ mod tests {
         let (cfg, pw) = build_connection_from_form(&form).unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.dbname, "app");
-        assert_eq!(cfg.ssl_mode, pgnative_db_connection::SslMode::Disable);
+        assert_eq!(cfg.ssl_mode, pgnative_db::connection::SslMode::Disable);
         assert!(pw.is_some());
     }
 
     #[test]
     fn build_connection_rejects_empty() {
-        let form = pgnative_ui_connections::ConnectionForm::default();
+        let form = crate::ui::connections::ConnectionForm::default();
         assert!(build_connection_from_form(&form).is_err());
     }
 

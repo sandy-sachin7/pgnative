@@ -24,38 +24,20 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 eframe = { workspace = true, features = ["x11", "wayland"] }
 egui = { workspace = true }
+egui_extras = { workspace = true }
 rusqlite = { workspace = true }
 directories = { workspace = true }
 secrecy = { workspace = true }
-pgnative-schema-model = { path = "../schema/model" }
-pgnative-schema-completion = { path = "../schema/completion" }
-pgnative-results-value = { path = "../results/value" }
-pgnative-results-edit = { path = "../results/edit" }
-pgnative-results-store = { path = "../results/store" }
-pgnative-results-export = { path = "../results/export" }
-pgnative-results-viewport = { path = "../results/viewport" }
-pgnative-db-connection = { path = "../db/connection" }
-pgnative-db-introspection = { path = "../db/introspection" }
-pgnative-results-stream = { path = "../results/stream" }
-pgnative-results-portal = { path = "../results/portal" }
+pgnative-schema = { path = "../schema" }
+pgnative-results = { path = "../results" }
+pgnative-db = { path = "../db" }
+pgnative-storage = { path = "../storage" }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
-pgnative-storage-connections = { path = "../storage/connections" }
-pgnative-storage-history = { path = "../storage/history" }
-pgnative-storage-editor-state = { path = "../storage/editor_state" }
-pgnative-storage-preferences = { path = "../storage/preferences" }
-pgnative-storage-keychain = { path = "../storage/keychain" }
-pgnative-ui-explorer = { path = "../ui/explorer" }
-pgnative-ui-editor = { path = "../ui/editor" }
-pgnative-ui-results = { path = "../ui/results" }
-pgnative-ui-layout = { path = "../ui/layout" }
-pgnative-ui-connections = { path = "../ui/connections" }
-pgnative-ui-history-panel = { path = "../ui/history_panel" }
-pgnative-ui-theme = { path = "../ui/theme" }
 
 [dev-dependencies]
 testcontainers = { workspace = true }

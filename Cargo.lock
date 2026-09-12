@@ -3252,31 +3252,13 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "egui_extras",
  "futures",
  "parking_lot",
- "pgnative-db-connection",
- "pgnative-db-introspection",
- "pgnative-results-edit",
- "pgnative-results-export",
- "pgnative-results-portal",
- "pgnative-results-store",
- "pgnative-results-stream",
- "pgnative-results-value",
- "pgnative-results-viewport",
- "pgnative-schema-completion",
- "pgnative-schema-model",
- "pgnative-storage-connections",
- "pgnative-storage-editor-state",
- "pgnative-storage-history",
- "pgnative-storage-keychain",
- "pgnative-storage-preferences",
- "pgnative-ui-connections",
- "pgnative-ui-editor",
- "pgnative-ui-explorer",
- "pgnative-ui-history-panel",
- "pgnative-ui-layout",
- "pgnative-ui-results",
- "pgnative-ui-theme",
+ "pgnative-db",
+ "pgnative-results",
+ "pgnative-schema",
+ "pgnative-storage",
  "rusqlite",
  "rustls",
  "secrecy",
@@ -3295,25 +3277,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgnative-db-cancellation"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "rustls",
- "thiserror 2.0.20",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tracing",
- "webpki-roots",
-]
-
-[[package]]
-name = "pgnative-db-connection"
+name = "pgnative-db"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "pgnative-schema",
  "rustls",
  "secrecy",
  "thiserror 2.0.20",
@@ -3328,102 +3296,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgnative-db-execution"
+name = "pgnative-results"
 version = "0.1.0"
 dependencies = [
- "async-trait",
+ "bigdecimal",
  "bytes",
- "futures",
- "pgnative-db-connection",
- "pgnative-results-value",
- "postgres-types",
- "thiserror 2.0.20",
- "tokio",
- "tokio-postgres",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-db-introspection"
-version = "0.1.0"
-dependencies = [
- "pgnative-schema-model",
- "thiserror 2.0.20",
- "tokio",
- "tokio-postgres",
- "tracing",
-]
-
-[[package]]
-name = "pgnative-observability"
-version = "0.1.0"
-dependencies = [
- "tracing",
-]
-
-[[package]]
-name = "pgnative-results-edit"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "pgnative-results-value",
- "pgnative-schema-model",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "pgnative-results-export"
-version = "0.1.0"
-dependencies = [
- "bytes",
+ "chrono",
  "csv",
- "pgnative-results-value",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "pgnative-results-portal"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "chrono",
  "futures",
- "pgnative-results-stream",
- "pgnative-results-value",
- "postgres-types",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tokio-postgres",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-results-store"
-version = "0.1.0"
-dependencies = [
- "bytes",
  "parking_lot",
- "pgnative-results-value",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "pgnative-results-stream"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "bytes",
- "chrono",
- "futures",
- "pgnative-results-value",
+ "pgnative-schema",
  "postgres-types",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -3433,179 +3317,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgnative-results-table-browser"
-version = "0.1.0"
-dependencies = [
- "pgnative-results-store",
- "pgnative-results-value",
- "pgnative-schema-model",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "pgnative-results-value"
-version = "0.1.0"
-dependencies = [
- "bigdecimal",
- "bytes",
- "chrono",
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-results-viewport"
-version = "0.1.0"
-dependencies = [
- "pgnative-results-store",
- "pgnative-results-value",
-]
-
-[[package]]
-name = "pgnative-schema-cache"
+name = "pgnative-schema"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "pgnative-schema-model",
+ "serde",
+ "serde_json",
+ "smol_str 0.3.6",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "pgnative-schema-completion"
-version = "0.1.0"
-dependencies = [
- "pgnative-schema-model",
- "smol_str 0.3.6",
-]
-
-[[package]]
-name = "pgnative-schema-model"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "smol_str 0.3.6",
  "uuid",
 ]
 
 [[package]]
-name = "pgnative-storage-connections"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-storage-editor-state"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-storage-history"
+name = "pgnative-storage"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "rusqlite",
- "serde",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "pgnative-storage-keychain"
-version = "0.1.0"
-dependencies = [
  "keyring",
- "pgnative-db-connection",
- "secrecy",
- "thiserror 2.0.20",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "pgnative-storage-preferences"
-version = "0.1.0"
-dependencies = [
+ "pgnative-db",
  "rusqlite",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "pgnative-ui-connections"
-version = "0.1.0"
-dependencies = [
- "egui",
-]
-
-[[package]]
-name = "pgnative-ui-editor"
-version = "0.1.0"
-dependencies = [
- "egui",
- "pgnative-schema-completion",
-]
-
-[[package]]
-name = "pgnative-ui-explorer"
-version = "0.1.0"
-dependencies = [
- "egui",
- "pgnative-schema-model",
-]
-
-[[package]]
-name = "pgnative-ui-history-panel"
-version = "0.1.0"
-dependencies = [
- "egui",
-]
-
-[[package]]
-name = "pgnative-ui-layout"
-version = "0.1.0"
-dependencies = [
- "egui",
- "serde",
-]
-
-[[package]]
-name = "pgnative-ui-results"
-version = "0.1.0"
-dependencies = [
- "egui",
- "egui_extras",
- "pgnative-results-store",
- "pgnative-results-value",
- "pgnative-results-viewport",
-]
-
-[[package]]
-name = "pgnative-ui-shortcuts"
-version = "0.1.0"
-dependencies = [
- "egui",
-]
-
-[[package]]
-name = "pgnative-ui-theme"
-version = "0.1.0"
-dependencies = [
- "egui",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

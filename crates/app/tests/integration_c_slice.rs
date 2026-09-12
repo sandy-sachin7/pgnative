@@ -9,9 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
-use pgnative_results_store::{ResultStore, SharedStore, StoreConfig};
-use pgnative_results_stream::{column_meta_from_pg, StreamConfig, StreamEvent};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, SslMode};
+use pgnative_results::store::{ResultStore, SharedStore, StoreConfig};
+use pgnative_results::stream::{column_meta_from_pg, StreamConfig, StreamEvent};
 use secrecy::SecretString;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -70,7 +70,7 @@ async fn connect_live_for_test(
     dbname: String,
     username: String,
     password: String,
-) -> pgnative_db_connection::LiveSession {
+) -> pgnative_db::connection::LiveSession {
     let cfg = ConnectionConfig {
         id: ConnectionId(Uuid::new_v4()),
         name: "c_slice".into(),
@@ -86,7 +86,7 @@ async fn connect_live_for_test(
     // Retry 5x with backoff — container may still be initializing
     let mut last_err = None;
     for attempt in 0..5 {
-        match pgnative_db_connection::connect_live(&cfg, Some(&secret)).await {
+        match pgnative_db::connection::connect_live(&cfg, Some(&secret)).await {
             Ok(s) => return s,
             Err(e) => {
                 last_err = Some(e);
@@ -103,7 +103,7 @@ async fn execute_and_collect(
     client: &tokio_postgres::Client,
     sql: &str,
     store: &SharedStore,
-) -> (Vec<pgnative_results_stream::ColumnMeta>, u64) {
+) -> (Vec<pgnative_results::stream::ColumnMeta>, u64) {
     let stmt = client.prepare(sql).await.expect("prepare should succeed");
     let metas: Vec<_> = stmt.columns().iter().map(column_meta_from_pg).collect();
     let empty: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
@@ -112,9 +112,9 @@ async fn execute_and_collect(
         .await
         .expect("query_raw should succeed");
     let stream = Box::pin(stream);
-    let (tx, mut rx) = pgnative_results_stream::channel(&StreamConfig::default());
+    let (tx, mut rx) = pgnative_results::stream::channel(&StreamConfig::default());
     let cols = metas.clone();
-    let drive = pgnative_results_stream::spawn_drive(stream, cols, StreamConfig::default(), tx);
+    let drive = pgnative_results::stream::spawn_drive(stream, cols, StreamConfig::default(), tx);
     let mut total = 0u64;
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -157,10 +157,10 @@ async fn c_gate_connect_introspect_select1_100rows_history_cancel() {
     );
 
     // 2) prepare_session + introspect — SchemaUpdated non-empty
-    pgnative_db_introspection::prepare_session(&sess.client)
+    pgnative_db::introspection::prepare_session(&sess.client)
         .await
         .expect("prepare_session");
-    let model = pgnative_db_introspection::introspect(&sess.client)
+    let model = pgnative_db::introspection::introspect(&sess.client)
         .await
         .expect("introspect should succeed");
     // At least pg_catalog schemas exist; non-empty
@@ -189,7 +189,7 @@ async fn c_gate_connect_introspect_select1_100rows_history_cancel() {
         let row = &snap[0];
         assert_eq!(row.cells.len(), 1);
         match &row.cells[0] {
-            pgnative_results_value::CellValue::Int(v) => {
+            pgnative_results::value::CellValue::Int(v) => {
                 assert_eq!(*v, 1, "int4=1 typed correctly")
             }
             other => panic!("expected Int(1), got {:?}", other),
@@ -236,23 +236,23 @@ async fn c_gate_connect_introspect_select1_100rows_history_cancel() {
         let first = &guard.snapshot_range(0, 1)[0];
         assert!(matches!(
             first.cells[0],
-            pgnative_results_value::CellValue::Int(0)
+            pgnative_results::value::CellValue::Int(0)
         ));
         assert!(matches!(
             first.cells[2],
-            pgnative_results_value::CellValue::Bool(true)
+            pgnative_results::value::CellValue::Bool(true)
         ));
         let last = &guard.snapshot_range(99, 1)[0];
         assert!(matches!(
             last.cells[0],
-            pgnative_results_value::CellValue::Int(99)
+            pgnative_results::value::CellValue::Int(99)
         ));
     }
 
     // 5) History insertion + search — prove §23 path
     let tmp_path = std::env::temp_dir().join(format!("pgnative-c-slice-{}.db", Uuid::new_v4()));
     let conn = pgnative_app::open_app_db(&tmp_path).expect("open temp app db");
-    let entry = pgnative_storage_history::HistoryEntry {
+    let entry = pgnative_storage::history::HistoryEntry {
         id: Uuid::new_v4(),
         connection_id: sess.id.0.to_string(),
         query_text: "SELECT 1".into(),
@@ -262,8 +262,8 @@ async fn c_gate_connect_introspect_select1_100rows_history_cancel() {
         success: true,
         error_code: None,
     };
-    pgnative_storage_history::insert(&conn, &entry).expect("history insert");
-    let results = pgnative_storage_history::search(&conn, "SELECT").expect("history search");
+    pgnative_storage::history::insert(&conn, &entry).expect("history insert");
+    let results = pgnative_storage::history::search(&conn, "SELECT").expect("history search");
     assert!(
         results.iter().any(|e| e.query_text.contains("SELECT 1")),
         "history search should find SELECT 1"
