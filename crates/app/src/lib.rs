@@ -883,6 +883,48 @@ impl eframe::App for PgnativeApp {
             }
         }
 
+        // Bottom: connections panel (collapsible). NOTE: side/bottom panels must
+        // be declared BEFORE CentralPanel or egui gives them no space.
+        egui::Panel::bottom("connections").show(ui, |ui| {
+            ui.collapsing("Connections", |ui| {
+                crate::ui::connections::show_connections(ui, &mut self.connection_form);
+                if let Some(err) = &self.connect_error {
+                    ui.colored_label(self.theme.danger, err);
+                }
+                ui.horizontal(|ui| {
+                    if ui.add(self.theme.primary_button("Connect")).clicked() {
+                        let display_name = if self.connection_form.name.trim().is_empty() {
+                            format!(
+                                "{} / {}",
+                                self.connection_form.host, self.connection_form.dbname
+                            )
+                        } else {
+                            self.connection_form.name.clone()
+                        };
+                        match build_connection_from_form(&self.connection_form) {
+                            Ok((cfg, password)) => {
+                                self.connect_error = None;
+                                self.active_connection_name = Some(display_name);
+                                persist_connection(&cfg, password.as_ref());
+                                self.controller.send_command(AppCommand::ConnectDirect {
+                                    config: cfg,
+                                    password,
+                                });
+                            }
+                            Err(e) => {
+                                self.connect_error = Some(e);
+                            }
+                        }
+                    }
+                    if let Some(id) = self.active_connection {
+                        if ui.button("Disconnect").clicked() {
+                            self.controller.send_command(AppCommand::Disconnect { id });
+                        }
+                    }
+                });
+            });
+        });
+
         // Central: editor tabs + virtualized results grid
         egui::CentralPanel::default().show(ui, |ui| {
             // Editor
@@ -1125,47 +1167,6 @@ impl eframe::App for PgnativeApp {
                 if let Some(status) = &self.export_status {
                     ui.label(egui::RichText::new(status).weak().small());
                 }
-            });
-        });
-
-        // Connections panel at bottom (collapsible)
-        egui::Panel::bottom("connections").show(ui, |ui| {
-            ui.collapsing("Connections", |ui| {
-                crate::ui::connections::show_connections(ui, &mut self.connection_form);
-                if let Some(err) = &self.connect_error {
-                    ui.colored_label(self.theme.danger, err);
-                }
-                ui.horizontal(|ui| {
-                    if ui.add(self.theme.primary_button("Connect")).clicked() {
-                        let display_name = if self.connection_form.name.trim().is_empty() {
-                            format!(
-                                "{} / {}",
-                                self.connection_form.host, self.connection_form.dbname
-                            )
-                        } else {
-                            self.connection_form.name.clone()
-                        };
-                        match build_connection_from_form(&self.connection_form) {
-                            Ok((cfg, password)) => {
-                                self.connect_error = None;
-                                self.active_connection_name = Some(display_name);
-                                persist_connection(&cfg, password.as_ref());
-                                self.controller.send_command(AppCommand::ConnectDirect {
-                                    config: cfg,
-                                    password,
-                                });
-                            }
-                            Err(e) => {
-                                self.connect_error = Some(e);
-                            }
-                        }
-                    }
-                    if let Some(id) = self.active_connection {
-                        if ui.button("Disconnect").clicked() {
-                            self.controller.send_command(AppCommand::Disconnect { id });
-                        }
-                    }
-                });
             });
         });
 
