@@ -14,8 +14,12 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
-use pgnative_db_connection::{ConnectionId, ConnectionState, QueryId, TxState};
+use pgnative_db_connection::{
+    parse_connection_url, ssl_mode_from_str, ConnectionConfig, ConnectionId, ConnectionState,
+    QueryId, TxState,
+};
 use pgnative_schema_model::SchemaModel;
+use secrecy::SecretString;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +31,12 @@ use uuid::Uuid;
 pub enum AppCommand {
     Connect {
         id: ConnectionId,
+    },
+    /// Direct connect with explicit config — test + programmatic path that
+    /// bypasses SQLite/keychain (used by integration C gate).
+    ConnectDirect {
+        config: ConnectionConfig,
+        password: Option<SecretString>,
     },
     Disconnect {
         id: ConnectionId,
@@ -78,8 +88,12 @@ pub enum AppEvent {
         model: Arc<SchemaModel>,
     },
     ExportProgress {
+        /// Query whose buffered rows were written.
         query_id: QueryId,
+        /// Number of rows written.
         written: u64,
+        /// Destination file path.
+        path: String,
     },
     Error {
         op: String,
@@ -330,6 +344,91 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
 // Keyring integration (§24) — non-secret in SQLite, secret in OS keychain
 // ---------------------------------------------------------------------------
 
+/// Build a [`ConnectionConfig`] + password from the connection form.
+///
+/// URL-first: when `form.url` is non-empty it is parsed via
+/// [`parse_connection_url`]; an explicitly typed password overrides the one
+/// embedded in the URL. Otherwise the individual host/port/db/user fields are
+/// used with the typed password. Never logs secrets.
+fn build_connection_from_form(
+    form: &pgnative_ui_connections::ConnectionForm,
+) -> Result<(ConnectionConfig, Option<SecretString>), String> {
+    if !form.url.trim().is_empty() {
+        let (mut cfg, url_pw) = parse_connection_url(&form.url)?;
+        if !form.password.is_empty() {
+            return Ok((cfg, Some(SecretString::new(form.password.clone().into()))));
+        }
+        if !form.name.trim().is_empty() {
+            cfg.name = form.name.trim().to_string();
+        }
+        return Ok((cfg, url_pw));
+    }
+    if form.dbname.trim().is_empty() {
+        return Err("database is required (or paste a connection URL)".to_string());
+    }
+    let name = if form.name.trim().is_empty() {
+        if form.username.trim().is_empty() {
+            format!("{}/{}", form.host.trim(), form.dbname.trim())
+        } else {
+            format!(
+                "{}@{}/{}",
+                form.username.trim(),
+                form.host.trim(),
+                form.dbname.trim()
+            )
+        }
+    } else {
+        form.name.trim().to_string()
+    };
+    let password = if form.password.is_empty() {
+        None
+    } else {
+        Some(SecretString::new(form.password.clone().into()))
+    };
+    Ok((
+        ConnectionConfig {
+            id: ConnectionId(Uuid::new_v4()),
+            name,
+            host: form.host.trim().to_string(),
+            port: form.port,
+            dbname: form.dbname.trim().to_string(),
+            username: form.username.trim().to_string(),
+            ssl_mode: ssl_mode_from_str(&form.ssl_mode),
+            ssl_root_cert: None,
+            ssh_tunnel: None,
+        },
+        password,
+    ))
+}
+
+/// Persist a connection's non-secret config to SQLite and its password to the
+/// OS keychain (best-effort: keychain failures are logged, never fatal, and
+/// never fall back to plaintext storage per §24).
+fn persist_connection(cfg: &ConnectionConfig, password: Option<&SecretString>) {
+    let saved = pgnative_storage_connections::SavedConnection {
+        id: cfg.id.0.to_string(),
+        name: cfg.name.clone(),
+        host: cfg.host.clone(),
+        port: cfg.port,
+        dbname: cfg.dbname.clone(),
+        username: cfg.username.clone(),
+        ssl_mode: cfg.ssl_mode.to_string(),
+    };
+    match open_app_db(&app_db_path()) {
+        Ok(conn) => {
+            if let Err(e) = pgnative_storage_connections::upsert(&conn, &saved) {
+                tracing::warn!("persist connection: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("persist connection (open db): {e}"),
+    }
+    if let Some(pw) = password {
+        if let Err(e) = store_password(cfg.id, pw.clone()) {
+            tracing::warn!("persist connection (keychain unavailable): {e}");
+        }
+    }
+}
+///
 /// Resolve password for a connection from the OS keychain.
 ///
 /// Returns `None` if absent (caller should prompt), never logs the secret.
@@ -372,6 +471,18 @@ pub struct PgnativeApp {
     pub history_query: String,
     pub history_results: Vec<String>,
     pub connection_form: pgnative_ui_connections::ConnectionForm,
+    /// Last connection error, shown inline in the connections panel.
+    pub connect_error: Option<String>,
+    /// Connection that Run/Refresh target — set on successful connect, never
+    /// guessed from `HashMap` iteration order.
+    pub active_connection: Option<ConnectionId>,
+    /// Most recent streaming query — Esc/Cancel and Export target this.
+    pub active_query: Option<QueryId>,
+    /// Last successfully finished query — Export stays available after the
+    /// stream completes (store still holds its buffered rows until next Execute).
+    pub last_completed_query: Option<QueryId>,
+    /// Result of the last export (saved path or error), shown under results.
+    pub export_status: Option<String>,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results_store::ResultStore>>,
     completion_cache: Option<Arc<pgnative_schema_completion::CompletionEngine>>,
@@ -426,17 +537,35 @@ impl PgnativeApp {
             });
         }
 
+        // Populate history panel with recents on launch (empty query → recents).
+        // Harmless if no runtime is running: the command just sits undrained.
+        controller.send_command(AppCommand::HistorySearch {
+            query: String::new(),
+        });
+
+        // First frame is usable immediately: one tab with a starter query
+        // so the user can connect and hit Ctrl+Enter without setup.
+        let mut editor_tabs = HashMap::new();
+        let mut first_tab = pgnative_ui_editor::EditorTab::new("tab-1");
+        first_tab.content = "-- Connect above, then Ctrl+Enter to run\nSELECT 1;".to_string();
+        editor_tabs.insert("tab-1".to_string(), first_tab);
+
         Self {
             controller,
             ui_state,
             viewport: pgnative_results_viewport::ViewportState::default(),
             theme,
             schema: None,
-            editor_tabs: HashMap::new(),
-            active_tab: None,
+            editor_tabs,
+            active_tab: Some("tab-1".to_string()),
             history_query: String::new(),
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
+            connect_error: None,
+            active_connection: None,
+            active_query: None,
+            last_completed_query: None,
+            export_status: None,
             store,
             completion_cache: None,
             completion_schema_ptr: None,
@@ -451,7 +580,11 @@ impl PgnativeApp {
                 AppEvent::SchemaUpdated { model, .. } => {
                     self.schema = Some(model);
                 }
-                AppEvent::ConnectionStateChanged { state, .. } => {
+                AppEvent::ConnectionStateChanged { id, state } => {
+                    if state == "connected" {
+                        self.connect_error = None;
+                        self.active_connection = Some(id);
+                    }
                     tracing::info!(state = %state, "connection state");
                 }
                 AppEvent::Error { op, message } => {
@@ -465,6 +598,12 @@ impl PgnativeApp {
                                 message.split("\n---\n").map(|s| s.to_string()).collect();
                         }
                     } else {
+                        if op == "connect" {
+                            self.connect_error = Some(message.clone());
+                        }
+                        if op == "export" {
+                            self.export_status = Some(message.clone());
+                        }
                         tracing::warn!(op = %op, message = %message, "app error");
                     }
                 }
@@ -476,6 +615,24 @@ impl PgnativeApp {
                 }
                 AppEvent::HistoryResults { results } => {
                     self.history_results = results;
+                }
+                AppEvent::QueryProgress { query_id, .. } => {
+                    self.active_query = Some(query_id);
+                    // A new stream invalidates the previous finished result.
+                    self.last_completed_query = None;
+                }
+                AppEvent::QueryFinished {
+                    query_id, success, ..
+                } => {
+                    if self.active_query == Some(query_id) {
+                        self.active_query = None;
+                    }
+                    if success {
+                        self.last_completed_query = Some(query_id);
+                    }
+                }
+                AppEvent::ExportProgress { written, path, .. } => {
+                    self.export_status = Some(format!("exported {written} rows → {path}"));
                 }
                 _ => {}
             }
@@ -490,15 +647,7 @@ impl PgnativeApp {
         if exec {
             if let Some(tab_id) = self.active_tab.clone() {
                 if let Some(tab) = self.editor_tabs.get(&tab_id) {
-                    if let Some(conn_id) = self
-                        .controller
-                        .state
-                        .read()
-                        .connections
-                        .keys()
-                        .next()
-                        .copied()
-                    {
+                    if let Some(conn_id) = self.active_connection {
                         self.controller.send_command(AppCommand::Execute {
                             tab: tab.id.clone(),
                             sql: tab.content.clone(),
@@ -510,22 +659,14 @@ impl PgnativeApp {
         }
         // Esc → cancel last query
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+            if let Some(qid) = self.active_query {
                 self.controller
                     .send_command(AppCommand::Cancel { query_id: qid });
             }
         }
         // F5 → refresh schema
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            if let Some(conn_id) = self
-                .controller
-                .state
-                .read()
-                .connections
-                .keys()
-                .next()
-                .copied()
-            {
+            if let Some(conn_id) = self.active_connection {
                 self.controller.send_command(AppCommand::RefreshSchema {
                     connection: conn_id,
                 });
@@ -601,15 +742,7 @@ impl eframe::App for PgnativeApp {
                     });
                 }
                 if ui.button("Refresh Schema").clicked() {
-                    if let Some(id) = self
-                        .controller
-                        .state
-                        .read()
-                        .connections
-                        .keys()
-                        .next()
-                        .copied()
-                    {
+                    if let Some(id) = self.active_connection {
                         self.controller
                             .send_command(AppCommand::RefreshSchema { connection: id });
                     }
@@ -640,8 +773,9 @@ impl eframe::App for PgnativeApp {
                 pgnative_ui_explorer::show_explorer(ui, model_ref, &self.ui_state.search);
             });
 
-        // Right: history panel (FTS) — driven by HistorySearch command
-        egui::Panel::right("history")
+        // Right: history panel (FTS) — driven by HistorySearch command.
+        // Clicking an entry loads it into the editor and re-runs it when connected.
+        let picked = egui::Panel::right("history")
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
@@ -656,8 +790,31 @@ impl eframe::App for PgnativeApp {
                     ui,
                     &self.history_query,
                     &self.history_results,
-                );
-            });
+                )
+            })
+            .inner;
+        if let Some(sql) = picked {
+            let tab_id = match self.active_tab.clone() {
+                Some(id) => id,
+                None => {
+                    let id = format!("tab-{}", self.editor_tabs.len() + 1);
+                    self.editor_tabs
+                        .insert(id.clone(), pgnative_ui_editor::EditorTab::new(id.clone()));
+                    self.active_tab = Some(id.clone());
+                    id
+                }
+            };
+            if let Some(tab) = self.editor_tabs.get_mut(&tab_id) {
+                tab.content = sql.clone();
+            }
+            if let Some(conn_id) = self.active_connection {
+                self.controller.send_command(AppCommand::Execute {
+                    tab: tab_id,
+                    sql,
+                    connection: conn_id,
+                });
+            }
+        }
 
         // Central: editor tabs + virtualized results grid
         egui::CentralPanel::default().show(ui, |ui| {
@@ -768,9 +925,7 @@ impl eframe::App for PgnativeApp {
                         }
                         if ui.button("Cancel (Esc)").clicked() {
                             // Cancel last query if any
-                            if let Some(qid) =
-                                self.controller.state.read().queries.keys().next().copied()
-                            {
+                            if let Some(qid) = self.active_query {
                                 self.controller
                                     .send_command(AppCommand::Cancel { query_id: qid });
                             }
@@ -781,43 +936,46 @@ impl eframe::App for PgnativeApp {
 
             ui.separator();
 
-            // Virtualized results — only visible + overscan rows (§18)
+            // Virtualized results — only visible + overscan rows (§18).
+            // Size the snapshot window from the available height so the
+            // scrolled-to rows are actually resident; the grid reports back
+            // the visible range for the next frame (see show_results).
+            let visible = (ui.available_height() / self.viewport.row_height)
+                .ceil()
+                .max(1.0) as usize;
+            self.viewport.len = visible + 2 * self.viewport.overscan;
             let store_guard = self.store.read();
+            // Columns + rows under one read lock so header and body agree.
+            let columns = store_guard.columns();
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
             // Show via ui/results helper (ScrollArea::show_rows internally)
-            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &[]);
+            pgnative_ui_results::show_results(ui, &mut self.viewport, &snap, &columns);
             ui.label(format!(
                 "rows: {} total (state: {:?})",
                 snap.rows.len(),
                 snap.state
             ));
-            // Export wiring placeholder (§28) — streams via runtime Export command
+            // Minimal CSV export (§28): buffered rows → temp-dir file via runtime.
+            // JSON/SQL formats stay unwired until demanded (no fake buttons).
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Export:").weak().small());
-                if ui.small_button("CSV").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
+                let export_target = self.active_query.or(self.last_completed_query);
+                if ui
+                    .small_button("CSV")
+                    .on_hover_text("Save buffered rows as CSV")
+                    .clicked()
+                {
+                    if let Some(qid) = export_target {
+                        self.export_status = None;
                         self.controller.send_command(AppCommand::Export {
                             query_id: qid,
                             format: ExportFormat::Csv,
                         });
                     }
                 }
-                if ui.small_button("JSON").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
-                        self.controller.send_command(AppCommand::Export {
-                            query_id: qid,
-                            format: ExportFormat::Json,
-                        });
-                    }
-                }
-                if ui.small_button("SQL").clicked() {
-                    if let Some(qid) = self.controller.state.read().queries.keys().next().copied() {
-                        self.controller.send_command(AppCommand::Export {
-                            query_id: qid,
-                            format: ExportFormat::SqlInsert,
-                        });
-                    }
+                if let Some(status) = &self.export_status {
+                    ui.label(egui::RichText::new(status).weak().small());
                 }
             });
         });
@@ -826,10 +984,24 @@ impl eframe::App for PgnativeApp {
         egui::Panel::bottom("connections").show(ui, |ui| {
             ui.collapsing("Connections", |ui| {
                 pgnative_ui_connections::show_connections(ui, &mut self.connection_form);
+                if let Some(err) = &self.connect_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() {
-                        let id = ConnectionId(Uuid::new_v4());
-                        self.controller.send_command(AppCommand::Connect { id });
+                        match build_connection_from_form(&self.connection_form) {
+                            Ok((cfg, password)) => {
+                                self.connect_error = None;
+                                persist_connection(&cfg, password.as_ref());
+                                self.controller.send_command(AppCommand::ConnectDirect {
+                                    config: cfg,
+                                    password,
+                                });
+                            }
+                            Err(e) => {
+                                self.connect_error = Some(e);
+                            }
+                        }
                     }
                 });
             });
@@ -877,6 +1049,46 @@ mod tests {
         assert!(!s.disconnect_requires_decision(id));
         s.set_tx(id, TxState::InFailedTransaction);
         assert!(s.disconnect_requires_decision(id));
+    }
+
+    #[test]
+    fn build_connection_prefers_url() {
+        let form = pgnative_ui_connections::ConnectionForm {
+            url: "postgres://bob:pw@db.example:5433/mydb?sslmode=require".into(),
+            password: String::new(),
+            ..Default::default()
+        };
+        let (cfg, pw) = build_connection_from_form(&form).unwrap();
+        assert_eq!(cfg.host, "db.example");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "mydb");
+        assert_eq!(cfg.username, "bob");
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn build_connection_manual_fields() {
+        let form = pgnative_ui_connections::ConnectionForm {
+            url: String::new(),
+            password: "s3cret".into(),
+            host: "127.0.0.1".into(),
+            port: 5432,
+            dbname: "app".into(),
+            username: "ann".into(),
+            ssl_mode: "disable".into(),
+            name: String::new(),
+        };
+        let (cfg, pw) = build_connection_from_form(&form).unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.dbname, "app");
+        assert_eq!(cfg.ssl_mode, pgnative_db_connection::SslMode::Disable);
+        assert!(pw.is_some());
+    }
+
+    #[test]
+    fn build_connection_rejects_empty() {
+        let form = pgnative_ui_connections::ConnectionForm::default();
+        assert!(build_connection_from_form(&form).is_err());
     }
 
     #[test]

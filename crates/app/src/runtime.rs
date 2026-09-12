@@ -131,6 +131,55 @@ pub fn spawn_runtime(
                         }
                     }
                 }
+                AppCommand::ConnectDirect { config, password } => {
+                    let ev_tx = event_tx.clone();
+                    match connect_live(&config, password.as_ref()).await {
+                        Ok(sess) => {
+                            let conn_id = sess.id;
+                            {
+                                let mut s = state.write();
+                                s.connections.insert(conn_id, sess.state());
+                            }
+                            let _ = ev_tx.try_send(AppEvent::ConnectionStateChanged {
+                                id: conn_id,
+                                state: "connected".into(),
+                            });
+                            let client_ref = &sess.client;
+                            let _ = pgnative_db_introspection::prepare_session(client_ref).await;
+                            match pgnative_db_introspection::introspect(client_ref).await {
+                                Ok(model) => {
+                                    let arc = Arc::new(model);
+                                    state.write().set_schema((*arc).clone());
+                                    let _ = ev_tx.try_send(AppEvent::SchemaUpdated {
+                                        connection: conn_id,
+                                        model: arc,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx.try_send(AppEvent::Error {
+                                        op: "introspect".into(),
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                            sessions.insert(conn_id, sess);
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.try_send(AppEvent::Error {
+                                op: "connect".into(),
+                                message: e.to_string(),
+                            });
+                            state.write().connections.insert(
+                                config.id,
+                                pgnative_db_connection::ConnectionState::Error {
+                                    id: Some(config.id),
+                                    kind: e.to_string(),
+                                    retryable: true,
+                                },
+                            );
+                        }
+                    }
+                }
                 AppCommand::Disconnect { id } => {
                     if let Some(mut sess) = sessions.remove(&id) {
                         sess.abort_driver();
@@ -169,6 +218,9 @@ pub fn spawn_runtime(
                     };
                     let qid = QueryId::new();
                     state.write().queries.insert(qid, sql.clone());
+                    // New query owns the shared store: drop Q1 rows/headers so
+                    // Q2 never renders stale data (§15).
+                    store.write().clear();
                     let cancel = sess.cancel_token();
                     let ssl_mode = sess.ssl_mode;
                     let ssl_root_cert = sess.ssl_root_cert.clone();
@@ -257,6 +309,13 @@ pub fn spawn_runtime(
                                 let mut total: u64 = 0;
                                 while let Some(ev) = rx.recv().await {
                                     match ev {
+                                        pgnative_results_stream::StreamEvent::Meta(metas) => {
+                                            let names = metas
+                                                .iter()
+                                                .map(|m| m.name.clone())
+                                                .collect::<Vec<_>>();
+                                            store_clone.write().set_columns(names);
+                                        }
                                         pgnative_results_stream::StreamEvent::Batch(batch) => {
                                             let n = batch.len() as u64;
                                             total += n;
@@ -447,9 +506,51 @@ pub fn spawn_runtime(
                     });
                 }
                 AppCommand::Export { query_id, format } => {
-                    let _ = event_tx.try_send(AppEvent::Error {
-                        op: "export".into(),
-                        message: format!("export {query_id} {format:?} not yet implemented"),
+                    // Minimal CSV export (§28): snapshot buffered rows (bounded
+                    // store, so this is the visible window — not the full
+                    // server-side result) and write one file. Blocking fs I/O
+                    // runs on spawn_blocking, off the dispatch loop.
+                    if !matches!(format, crate::ExportFormat::Csv) {
+                        let _ = event_tx.try_send(AppEvent::Error {
+                            op: "export".into(),
+                            message: "only CSV export is supported for now".into(),
+                        });
+                        return;
+                    }
+                    let ev_tx = event_tx.clone();
+                    let store_clone = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let (columns, rows) = {
+                            let guard = store_clone.read();
+                            (guard.columns(), guard.snapshot_range(0, guard.len()))
+                        };
+                        let csv = match pgnative_results_export::export_csv(&rows, &columns) {
+                            Ok(csv) => csv,
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "export".into(),
+                                    message: format!("csv encode failed: {e}"),
+                                });
+                                return;
+                            }
+                        };
+                        let path =
+                            std::env::temp_dir().join(format!("pgnative-export-{query_id}.csv"));
+                        match std::fs::write(&path, csv) {
+                            Ok(()) => {
+                                let _ = ev_tx.try_send(AppEvent::ExportProgress {
+                                    query_id,
+                                    written: rows.len() as u64,
+                                    path: path.display().to_string(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "export".into(),
+                                    message: format!("write {} failed: {e}", path.display()),
+                                });
+                            }
+                        }
                     });
                 }
             }
