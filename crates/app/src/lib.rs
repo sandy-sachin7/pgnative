@@ -853,8 +853,10 @@ impl eframe::App for PgnativeApp {
             if let Some(tab_id) = self.active_tab.clone() {
                 if let Some(tab) = self.editor_tabs.get_mut(&tab_id) {
                     let mut content = tab.content.clone();
+                    let editor_id = egui::Id::new(("sql-editor", tab.id.clone()));
                     let resp = ui.add(
                         egui::TextEdit::multiline(&mut content)
+                            .id(editor_id)
                             .desired_rows(12)
                             .desired_width(f32::INFINITY)
                             .hint_text("SELECT * FROM ..."),
@@ -891,7 +893,9 @@ impl eframe::App for PgnativeApp {
                             }
                         }
                     }
-                    // Completion preview — cache engine per schema Arc ptr per §30.
+                    // Completion — cursor-aware: real caret (1-frame lag) with
+                    // end-of-text fallback; aliases + dot-target from text
+                    // before the cursor; cache engine per schema Arc ptr (§30).
                     if let Some(schema) = &self.schema {
                         let ptr = Arc::as_ptr(schema);
                         let engine: Arc<pgnative_schema::completion::CompletionEngine> =
@@ -914,17 +918,55 @@ impl eframe::App for PgnativeApp {
                                 self.completion_schema_ptr = Some(ptr);
                                 e
                             };
-                        // Prefix = last word before cursor
-                        let prefix = tab
-                            .content
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or("")
-                            .to_string();
-                        if !prefix.is_empty() {
-                            let completions = crate::ui::editor::completions_for(&engine, &prefix);
+                        let cursor_bytes = egui::TextEdit::load_state(ui.ctx(), editor_id)
+                            .and_then(|s| s.cursor.char_range())
+                            .map(|r| {
+                                crate::ui::editor::char_to_byte(&tab.content, r.primary.index.0)
+                            })
+                            .unwrap_or(tab.content.len());
+                        tab.cursor = cursor_bytes;
+                        let before = tab.content.get(..cursor_bytes).unwrap_or("");
+                        let (prefix, dot_target) = crate::ui::editor::completion_target(before);
+                        if !prefix.is_empty() || dot_target.is_some() {
+                            let aliases = pgnative_schema::completion::extract_aliases_with_model(
+                                &tab.content,
+                                cursor_bytes,
+                                schema,
+                            );
+                            let completions = crate::ui::editor::completions_for(
+                                &engine,
+                                &prefix,
+                                &aliases,
+                                dot_target.as_deref(),
+                            );
                             if !completions.is_empty() {
-                                ui.label(format!("completions: {}", completions.join(", ")));
+                                let mut picked: Option<(usize, String)> = None;
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    for (idx, item) in completions.iter().take(8).enumerate() {
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                format!("{}  ({:?})", item.label, item.kind)
+                                                    .to_ascii_lowercase(),
+                                            )
+                                            .clicked()
+                                        {
+                                            picked = Some((idx, item.insert_text.clone()));
+                                        }
+                                    }
+                                    if completions.len() > 8 {
+                                        ui.label(format!("+{} more…", completions.len() - 8));
+                                    }
+                                });
+                                // Splice insert_text over the typed prefix.
+                                if let Some((_, insert)) = picked {
+                                    let replace_start = cursor_bytes.saturating_sub(prefix.len());
+                                    if tab.content.get(replace_start..cursor_bytes).is_some() {
+                                        tab.content
+                                            .replace_range(replace_start..cursor_bytes, &insert);
+                                        tab.cursor = replace_start + insert.len();
+                                    }
+                                }
                             }
                         }
                     }
