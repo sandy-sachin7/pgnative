@@ -69,6 +69,29 @@ pub enum StreamError {
     Decode(String),
 }
 
+/// Render a `tokio_postgres::Error` as human-readable text.
+///
+/// `Error`'s own `Display` collapses server errors to the literal
+/// `"db error"` (`Kind::Db`), so unwrap the `DbError` source for the
+/// severity/message/code/detail/hint PostgreSQL actually sent.
+#[must_use]
+pub fn pg_error_text(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut out = format!("{}: {} [{}]", db.severity(), db.message(), db.code().code());
+        if let Some(detail) = db.detail() {
+            out.push_str("\nDetail: ");
+            out.push_str(detail);
+        }
+        if let Some(hint) = db.hint() {
+            out.push_str("\nHint: ");
+            out.push_str(hint);
+        }
+        out
+    } else {
+        e.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Channel helpers — backpressure is `tokio::sync::mpsc::bounded(channel_cap)`.
 // Producer `send().await` blocks when consumer is slow (plan C2).
@@ -581,7 +604,7 @@ where
             }
             Err(e) => {
                 let _ = tx
-                    .send(StreamEvent::Error(StreamError::Pg(e.to_string())))
+                    .send(StreamEvent::Error(StreamError::Pg(pg_error_text(&e))))
                     .await;
                 return Ok(());
             }

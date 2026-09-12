@@ -10,6 +10,29 @@ use crate::{AppCommand, AppEvent, AppState};
 
 type SessionMap = HashMap<ConnectionId, LiveSession>;
 
+/// Reliable send for terminal/lifecycle events (`QueryFinished`,
+/// `DisconnectRequiresDecision`).
+///
+/// E2E proved the race: a 120k-row query emits ~2k `QueryProgress` events in
+/// one burst; the bounded (256) event channel fills and a trailing
+/// `try_send(QueryFinished)` is silently dropped, so the UI (or driver)
+/// waits forever for a finish that will never arrive. Retry briefly instead
+/// of dropping — the UI drains continuously so this resolves in ms and never
+/// blocks the executor (async sleep between attempts).
+async fn send_reliable(tx: &crossbeam_channel::Sender<AppEvent>, mut ev: AppEvent) {
+    for _ in 0..200 {
+        match tx.try_send(ev) {
+            Ok(()) => return,
+            Err(crossbeam_channel::TrySendError::Full(ret)) => {
+                ev = ret;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
+        }
+    }
+    let _ = tx.try_send(ev);
+}
+
 struct QueryEntry {
     id: QueryId,
     connection: ConnectionId,
@@ -224,7 +247,7 @@ pub fn spawn_runtime(
                     // `ResolveTransaction`. PG would roll back on close, so we
                     // must not tear down before the user decides.
                     if state.read().disconnect_requires_decision(id) {
-                        let _ = event_tx.try_send(AppEvent::DisconnectRequiresDecision { id });
+                        send_reliable(&event_tx, AppEvent::DisconnectRequiresDecision { id }).await;
                         continue;
                     }
                     teardown_connection(id, &mut sessions, &queries, &state, &event_tx);
@@ -340,14 +363,23 @@ pub fn spawn_runtime(
                                 (metas, r)
                             }
                             Err(e) => {
+                                // NB: `e.to_string()` alone renders server
+                                // errors as the literal "db error"
+                                // (tokio_postgres `Kind::Db`); unwrap the
+                                // DbError source for the real message.
+                                store_clone.write().fail();
                                 let _ = ev_tx.try_send(AppEvent::Error {
                                     op: "query".into(),
-                                    message: e.to_string(),
+                                    message: pgnative_results::stream::pg_error_text(&e),
                                 });
-                                let _ = ev_tx.try_send(AppEvent::QueryFinished {
-                                    query_id: qid,
-                                    success: false,
-                                });
+                                send_reliable(
+                                    &ev_tx,
+                                    AppEvent::QueryFinished {
+                                        query_id: qid,
+                                        success: false,
+                                    },
+                                )
+                                .await;
                                 return;
                             }
                         };
@@ -366,6 +398,12 @@ pub fn spawn_runtime(
                                     tx,
                                 );
                                 let mut total: u64 = 0;
+                                // Throttle progress: a 120k-row burst would
+                                // otherwise flood the 256-cap event channel and
+                                // starve the terminal QueryFinished (E2E S9).
+                                let mut last_progress = std::time::Instant::now()
+                                    .checked_sub(std::time::Duration::from_secs(1))
+                                    .unwrap_or_else(std::time::Instant::now);
                                 while let Some(ev) = rx.recv().await {
                                     match ev {
                                         pgnative_results::stream::StreamEvent::Meta(metas) => {
@@ -381,10 +419,15 @@ pub fn spawn_runtime(
                                             {
                                                 store_clone.write().push_batch(batch);
                                             }
-                                            let _ = ev_tx.try_send(AppEvent::QueryProgress {
-                                                query_id: qid,
-                                                rows: total,
-                                            });
+                                            if last_progress.elapsed()
+                                                >= std::time::Duration::from_millis(200)
+                                            {
+                                                last_progress = std::time::Instant::now();
+                                                let _ = ev_tx.try_send(AppEvent::QueryProgress {
+                                                    query_id: qid,
+                                                    rows: total,
+                                                });
+                                            }
                                         }
                                         pgnative_results::stream::StreamEvent::Complete {
                                             rows,
@@ -401,10 +444,14 @@ pub fn spawn_runtime(
                                                     .write()
                                                     .set_tx(conn_for_history, tx);
                                             }
-                                            let _ = ev_tx.try_send(AppEvent::QueryFinished {
-                                                query_id: qid,
-                                                success: true,
-                                            });
+                                            send_reliable(
+                                                &ev_tx,
+                                                AppEvent::QueryFinished {
+                                                    query_id: qid,
+                                                    success: true,
+                                                },
+                                            )
+                                            .await;
                                             let hist_sql = sql_for_history.clone();
                                             tokio::task::spawn_blocking(move || {
                                                 if let Ok(conn) =
@@ -433,15 +480,22 @@ pub fn spawn_runtime(
                                             break;
                                         }
                                         pgnative_results::stream::StreamEvent::Error(e) => {
-                                            store_clone.write().cancel();
+                                            // Genuine stream failure, not a user cancel —
+                                            // mark Error (StreamError::Pg already carries
+                                            // the unwrapped server message).
+                                            store_clone.write().fail();
                                             let _ = ev_tx.try_send(AppEvent::Error {
                                                 op: "query".into(),
                                                 message: e.to_string(),
                                             });
-                                            let _ = ev_tx.try_send(AppEvent::QueryFinished {
-                                                query_id: qid,
-                                                success: false,
-                                            });
+                                            send_reliable(
+                                                &ev_tx,
+                                                AppEvent::QueryFinished {
+                                                    query_id: qid,
+                                                    success: false,
+                                                },
+                                            )
+                                            .await;
                                             break;
                                         }
                                         _ => {}
@@ -450,14 +504,19 @@ pub fn spawn_runtime(
                                 let _ = drive.await;
                             }
                             Err(e) => {
+                                store_clone.write().fail();
                                 let _ = ev_tx.try_send(AppEvent::Error {
                                     op: "query".into(),
-                                    message: e.to_string(),
+                                    message: pgnative_results::stream::pg_error_text(&e),
                                 });
-                                let _ = ev_tx.try_send(AppEvent::QueryFinished {
-                                    query_id: qid,
-                                    success: false,
-                                });
+                                send_reliable(
+                                    &ev_tx,
+                                    AppEvent::QueryFinished {
+                                        query_id: qid,
+                                        success: false,
+                                    },
+                                )
+                                .await;
                             }
                         }
                     });
@@ -504,10 +563,14 @@ pub fn spawn_runtime(
                                         // Treat as cancel failure — poisoned path below will also handle,
                                         // but we short-circuit to avoid fabricating tokio_postgres::Error.
                                         entry.handle.abort();
-                                        let _ = event_tx.try_send(AppEvent::QueryFinished {
-                                            query_id,
-                                            success: false,
-                                        });
+                                        send_reliable(
+                                            &event_tx,
+                                            AppEvent::QueryFinished {
+                                                query_id,
+                                                success: false,
+                                            },
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 }
@@ -523,10 +586,14 @@ pub fn spawn_runtime(
                             }
                         }
                         entry.handle.abort();
-                        let _ = event_tx.try_send(AppEvent::QueryFinished {
-                            query_id,
-                            success: false,
-                        });
+                        send_reliable(
+                            &event_tx,
+                            AppEvent::QueryFinished {
+                                query_id,
+                                success: false,
+                            },
+                        )
+                        .await;
                     }
                 }
                 AppCommand::RefreshSchema { connection } => {
