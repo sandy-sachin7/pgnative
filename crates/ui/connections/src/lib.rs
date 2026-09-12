@@ -1,5 +1,11 @@
 //! Connection form UI (§26).
 pub struct ConnectionForm {
+    /// Full `postgres://user:pass@host:port/db?sslmode=` URL — primary input.
+    /// When non-empty, individual fields below are ignored.
+    pub url: String,
+    /// Password kept ephemeral in memory only (never logged); persisted to
+    /// the OS keychain on connect, never to SQLite.
+    pub password: String,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -10,6 +16,8 @@ pub struct ConnectionForm {
 impl Default for ConnectionForm {
     fn default() -> Self {
         Self {
+            url: String::new(),
+            password: String::new(),
             name: String::new(),
             host: "localhost".into(),
             port: 5432,
@@ -20,6 +28,11 @@ impl Default for ConnectionForm {
     }
 }
 pub fn show_connections(ui: &mut egui::Ui, form: &mut ConnectionForm) {
+    ui.label("Paste a connection URL (recommended):");
+    ui.text_edit_singleline(&mut form.url);
+    ui.label("Password (stored in OS keychain, never in SQLite):");
+    ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+    ui.separator();
     egui::Grid::new("connection_form_grid")
         .num_columns(2)
         .spacing([8.0, 6.0])
