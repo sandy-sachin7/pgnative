@@ -218,6 +218,9 @@ pub fn spawn_runtime(
                     };
                     let qid = QueryId::new();
                     state.write().queries.insert(qid, sql.clone());
+                    // New query owns the shared store: drop Q1 rows/headers so
+                    // Q2 never renders stale data (§15).
+                    store.write().clear();
                     let cancel = sess.cancel_token();
                     let ssl_mode = sess.ssl_mode;
                     let ssl_root_cert = sess.ssl_root_cert.clone();
@@ -306,6 +309,13 @@ pub fn spawn_runtime(
                                 let mut total: u64 = 0;
                                 while let Some(ev) = rx.recv().await {
                                     match ev {
+                                        pgnative_results_stream::StreamEvent::Meta(metas) => {
+                                            let names = metas
+                                                .iter()
+                                                .map(|m| m.name.clone())
+                                                .collect::<Vec<_>>();
+                                            store_clone.write().set_columns(names);
+                                        }
                                         pgnative_results_stream::StreamEvent::Batch(batch) => {
                                             let n = batch.len() as u64;
                                             total += n;

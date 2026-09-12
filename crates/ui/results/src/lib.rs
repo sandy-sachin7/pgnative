@@ -21,6 +21,8 @@ pub fn show_results(
         return;
     }
     // Header
+    let overscan = viewport.overscan;
+    let mut first_visible: Option<usize> = None;
     egui::ScrollArea::horizontal().show(ui, |ui| {
         ui.horizontal(|ui| {
             for name in columns {
@@ -36,14 +38,15 @@ pub fn show_results(
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show_rows(ui, row_height, total_rows, |ui, range| {
+                first_visible = Some(range.start);
                 // Clamp range to snapshot window (store may have evicted oldest rows)
                 // Map global range to snapshot offset
                 let start = range.start;
                 let end = range.end.min(total_rows);
-                // Update viewport offset for next snapshot fetch (eframe integration)
-                // We don't mutate viewport offset here to avoid feedback loop; caller
-                // should sync via `viewport.set_offset_from_scroll(ui.clip_rect()...)`
-                // For now, render the slice that overlaps our snapshot.
+                // Update viewport offset for next snapshot fetch (eframe integration):
+                // record the visible start; after `show_rows` the caller backs
+                // off by `overscan` so the next snapshot covers visible rows
+                // plus margin above. One frame lag during scroll, exact at rest.
                 for idx in start..end {
                     // Determine if idx is within snapshot window
                     let snap_idx = idx.checked_sub(snapshot.offset);
@@ -74,6 +77,12 @@ pub fn show_results(
                 }
             });
     });
+    // Report the visible window back: the caller sizes `len` from the panel
+    // height before snapshotting, and the next frame's snapshot starts at the
+    // scrolled-to row (one frame lag during active scroll, exact at rest).
+    if let Some(start) = first_visible {
+        viewport.offset = start.saturating_sub(overscan);
+    }
 
     // Footer: truncation affordance
     if snapshot.total > 0 {
