@@ -907,15 +907,7 @@ impl eframe::App for PgnativeApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Run (Ctrl+Enter)").clicked() {
-                            if let Some(conn_id) = self
-                                .controller
-                                .state
-                                .read()
-                                .connections
-                                .keys()
-                                .next()
-                                .copied()
-                            {
+                            if let Some(conn_id) = self.active_connection {
                                 self.controller.send_command(AppCommand::Execute {
                                     tab: tab.id.clone(),
                                     sql: tab.content.clone(),

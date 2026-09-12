@@ -932,4 +932,31 @@ mod tests {
         assert!(err.contains("postgres"));
         assert!(!err.contains("secret"));
     }
+
+    #[test]
+    fn ssl_mode_mapping_never_defaults_insecure() {
+        // Every accepted spelling maps to the intended TLS posture …
+        assert_eq!(ssl_mode_from_str("disable"), SslMode::Disable);
+        assert_eq!(ssl_mode_from_str("DISABLE"), SslMode::Disable);
+        assert_eq!(ssl_mode_from_str("require"), SslMode::Require);
+        assert_eq!(ssl_mode_from_str("verify-ca"), SslMode::VerifyCa);
+        assert_eq!(ssl_mode_from_str("verify_ca"), SslMode::VerifyCa);
+        assert_eq!(ssl_mode_from_str("verify-full"), SslMode::VerifyFull);
+        assert_eq!(ssl_mode_from_str("verify_full"), SslMode::VerifyFull);
+        assert_eq!(ssl_mode_from_str("prefer"), SslMode::Prefer);
+        // … and anything unknown falls back to Prefer, never Disable.
+        for raw in ["", "garbage", "off", "none", "verify"] {
+            assert_eq!(ssl_mode_from_str(raw), SslMode::Prefer, "input {raw:?}");
+        }
+        // Display round-trips through the parser.
+        for mode in [
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            assert_eq!(ssl_mode_from_str(&mode.to_string()), mode);
+        }
+    }
 }

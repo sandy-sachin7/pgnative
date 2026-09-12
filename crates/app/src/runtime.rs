@@ -181,6 +181,12 @@ pub fn spawn_runtime(
                     }
                 }
                 AppCommand::Disconnect { id } => {
+                    // §22: surface the decision hook before tearing down. We still
+                    // disconnect (PG rolls back the open txn on close — we never
+                    // commit), but the event lets the UI warn instead of staying silent.
+                    if state.read().disconnect_requires_decision(id) {
+                        let _ = event_tx.try_send(AppEvent::DisconnectRequiresDecision { id });
+                    }
                     if let Some(mut sess) = sessions.remove(&id) {
                         sess.abort_driver();
                     }
@@ -261,6 +267,8 @@ pub fn spawn_runtime(
                                 self.state.write().queries.remove(&self.qid);
                             }
                         }
+                        // Separate handle for §22 tx tracking (QGuard owns state_clone).
+                        let tx_state_handle = Arc::clone(&state_clone);
                         let _qguard = QGuard {
                             qid,
                             queries: queries_clone,
@@ -332,6 +340,16 @@ pub fn spawn_runtime(
                                             ..
                                         } => {
                                             store_clone.write().complete();
+                                            // §22 optimistic tx tracking: BEGIN/COMMIT/ROLLBACK
+                                            // update the badge/decision state; authoritative
+                                            // correction comes from ReadyForQuery when wired.
+                                            if let Some(tx) =
+                                                pgnative_db_connection::classify_tx(&sql_exec)
+                                            {
+                                                tx_state_handle
+                                                    .write()
+                                                    .set_tx(conn_for_history, tx);
+                                            }
                                             let _ = ev_tx.try_send(AppEvent::QueryFinished {
                                                 query_id: qid,
                                                 success: true,
@@ -564,13 +582,7 @@ fn load_connection_config(id: ConnectionId) -> Option<ConnectionConfig> {
     let path = crate::app_db_path();
     let conn = crate::open_app_db(&path).ok()?;
     let sc = load_saved(&conn, &id.0.to_string())?;
-    let ssl_mode = match sc.ssl_mode.as_str() {
-        "disable" => SslMode::Disable,
-        "require" => SslMode::Require,
-        "verify-ca" => SslMode::VerifyCa,
-        "verify-full" => SslMode::VerifyFull,
-        _ => SslMode::Prefer,
-    };
+    let ssl_mode = pgnative_db_connection::ssl_mode_from_str(&sc.ssl_mode);
     Some(ConnectionConfig {
         id,
         name: sc.name,

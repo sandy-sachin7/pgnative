@@ -186,6 +186,30 @@ pub fn update_sql_with_pk(
     Ok((sql, params))
 }
 
+/// Optimistic-concurrency UPDATE (§21): `WHERE pk=$N AND "changed_col"=$M(old)`.
+///
+/// Appends the *original* values of every changed column to the WHERE clause.
+/// Callers execute with the returned params and check the affected-row count:
+/// `0` rows ⇒ someone else changed the row first (stale) — surface a conflict
+/// instead of silently overwriting. Param order: SET-new…, PK…, WHERE-old….
+pub fn update_sql_optimistic(
+    rel: &Relation,
+    diffs: &[ColumnDiff],
+    pk_values: &[(String, String)],
+) -> Result<(String, Vec<String>), EditError> {
+    let (mut sql, mut params) = update_sql_with_pk(rel, diffs, pk_values)?;
+    // `update_sql_with_pk` ends with `RETURNING *` — splice the version check
+    // in before it so row identity + freshness gate in one statement.
+    let mut where_old = Vec::with_capacity(diffs.len());
+    for d in diffs {
+        params.push(d.old.clone());
+        where_old.push(format!("{}=${}", quoted_ident(&d.col), params.len()));
+    }
+    let guard = where_old.join(" AND ");
+    sql = sql.replacen(" RETURNING *", &format!(" AND {guard} RETURNING *"), 1);
+    Ok((sql, params))
+}
+
 /// Explicitly rejected: MERGE in v1.
 pub fn merge_sql(
     _rel: &Relation,
@@ -271,5 +295,62 @@ mod tests {
         assert!(update_sql_with_pk(&rel, &diffs, &[("wrong".into(), "1".into())]).is_err());
         // empty value → error
         assert!(update_sql_with_pk(&rel, &diffs, &[("id".into(), "".into())]).is_err());
+    }
+
+    fn rel_composite_pk() -> Relation {
+        let mut rel = rel_with_pk();
+        rel.columns.push(Column {
+            id: Id(2),
+            owner: Id(0),
+            name: "tenant".into(),
+            position: 3,
+            ty: Id(0),
+            nullability: Nullability::NotNull,
+            has_default: false,
+            default_expr: None,
+            value_source: ValueSource::Stored,
+        });
+        rel.primary_key = Some(PrimaryKey {
+            columns: vec![Id(0), Id(2)],
+            name: None,
+        });
+        rel
+    }
+
+    #[test]
+    fn composite_pk_binds_both_keys_in_order() {
+        let rel = rel_composite_pk();
+        let diffs = vec![ColumnDiff {
+            col: "email".into(),
+            old: "a".into(),
+            new: "b".into(),
+        }];
+        // One of two PK values → rejected, never half-bound.
+        assert!(update_sql_with_pk(&rel, &diffs, &[("id".into(), "1".into())]).is_err());
+        let pk = vec![("id".into(), "1".into()), ("tenant".into(), "t9".into())];
+        let (sql, params) = update_sql_with_pk(&rel, &diffs, &pk).unwrap();
+        assert!(sql.contains("\"id\"=$2 AND \"tenant\"=$3"), "got: {sql}");
+        assert_eq!(
+            params,
+            vec!["b".to_string(), "1".to_string(), "t9".to_string()]
+        );
+    }
+
+    #[test]
+    fn optimistic_update_guards_on_old_values() {
+        let rel = rel_with_pk();
+        let diffs = vec![ColumnDiff {
+            col: "email".into(),
+            old: "a@b".into(),
+            new: "c@d".into(),
+        }];
+        let pk = vec![("id".into(), "1".into())];
+        let (sql, params) = update_sql_optimistic(&rel, &diffs, &pk).unwrap();
+        // SET-new ($1), PK ($2), then old-value guard ($3).
+        assert!(sql.contains("AND \"email\"=$3 RETURNING *"), "got: {sql}");
+        assert_eq!(
+            params,
+            vec!["c@d".to_string(), "1".to_string(), "a@b".to_string()]
+        );
     }
 }

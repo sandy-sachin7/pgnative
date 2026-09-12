@@ -63,6 +63,58 @@ pub fn export_json(rows: &[Row]) -> Result<String, ExportError> {
     Ok(out)
 }
 
+fn sql_literal(cell: &CellValue) -> String {
+    match cell {
+        CellValue::Null => "NULL".to_owned(),
+        CellValue::Bool(b) => b.to_string(),
+        CellValue::SmallInt(v) => v.to_string(),
+        CellValue::Int(v) => v.to_string(),
+        CellValue::BigInt(v) => v.to_string(),
+        CellValue::Float(v) => v.to_string(),
+        CellValue::Double(v) => v.to_string(),
+        CellValue::Numeric(v) => v.to_string(),
+        _ => format!("'{}'", cell.to_display_string().replace('\'', "''")),
+    }
+}
+
+/// Render `INSERT INTO "table" ("cols") VALUES (...), ...;` with
+/// single-quote escaping, bare numerics/booleans, bare `NULL`.
+/// Empty row sets produce a commented-out statement (never invalid SQL).
+pub fn export_sql_insert(
+    table: &str,
+    columns: &[String],
+    rows: &[Row],
+) -> Result<String, ExportError> {
+    let mut out = String::new();
+    if rows.is_empty() {
+        out.push_str("-- no rows to export");
+        return Ok(out);
+    }
+    let cols = columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "INSERT INTO \"{}\" ({cols}) VALUES\n",
+        table.replace('"', "\"\"")
+    ));
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        let vals = row
+            .cells
+            .iter()
+            .map(sql_literal)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("({vals})"));
+    }
+    out.push(';');
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +134,44 @@ mod tests {
         let j = export_json(&rows).unwrap();
         assert!(j.contains("null"));
         assert!(j.contains("1"));
+    }
+    #[test]
+    fn sql_insert_escapes_quotes_and_null() {
+        let rows = vec![
+            Row::new(vec![
+                CellValue::Text("O'Brien".into()),
+                CellValue::Null,
+                CellValue::Int(7),
+                CellValue::Bool(true),
+            ]),
+            Row::new(vec![
+                CellValue::Text("plain".into()),
+                CellValue::Text("x".into()),
+                CellValue::BigInt(-3),
+                CellValue::Bool(false),
+            ]),
+        ];
+        let sql = export_sql_insert(
+            "users",
+            &["name".into(), "nick".into(), "n".into(), "ok".into()],
+            &rows,
+        )
+        .unwrap();
+        assert!(sql.starts_with("INSERT INTO \"users\" (\"name\", \"nick\", \"n\", \"ok\") VALUES"));
+        assert!(
+            sql.contains("'O''Brien'"),
+            "single quote must double: {sql}"
+        );
+        assert!(sql.contains("NULL"), "NULL must be bare, got: {sql}");
+        assert!(
+            !sql.contains("'7'") && !sql.contains("'true'"),
+            "numerics/bools bare: {sql}"
+        );
+        assert!(sql.ends_with(';'));
+    }
+    #[test]
+    fn sql_insert_empty_rows_is_comment() {
+        let sql = export_sql_insert("t", &["a".into()], &[]).unwrap();
+        assert!(sql.starts_with("--"));
     }
 }
