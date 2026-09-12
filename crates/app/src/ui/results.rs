@@ -2,6 +2,7 @@
 //! Wiring: `BoundedStore (Arc<RwLock>)` → `ViewportState` → `egui::ScrollArea::show_rows`.
 //! No per-frame full-materialization, no egui widget per row for 500k rows.
 
+use super::theme::Theme;
 use egui::{Align, Layout};
 use pgnative_results::value::CellValue;
 use pgnative_results::viewport::{ViewportSnapshot, ViewportState};
@@ -15,20 +16,32 @@ pub fn show_results(
     viewport: &mut ViewportState,
     snapshot: &ViewportSnapshot,
     columns: &[String],
+    theme: &Theme,
 ) {
     if snapshot.rows.is_empty() && snapshot.total == 0 {
-        ui.label("No rows");
+        ui.label(
+            egui::RichText::new("No rows — run a query with Ctrl+Enter")
+                .weak()
+                .small(),
+        );
         return;
     }
-    // Header
+    // Header band
     let overscan = viewport.overscan;
     let mut first_visible: Option<usize> = None;
     egui::ScrollArea::horizontal().show(ui, |ui| {
-        ui.horizontal(|ui| {
-            for name in columns {
-                ui.label(egui::RichText::new(name).strong());
-                ui.separator();
-            }
+        theme.band().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for name in columns {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .small()
+                            .strong()
+                            .color(theme.text_secondary),
+                    );
+                    ui.separator();
+                }
+            });
         });
         ui.separator();
 
@@ -51,29 +64,50 @@ pub fn show_results(
                     // Determine if idx is within snapshot window
                     let snap_idx = idx.checked_sub(snapshot.offset);
                     let row = snap_idx.and_then(|i| snapshot.rows.get(i));
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}", idx + 1));
-                        ui.separator();
-                        if let Some(row) = row {
-                            for cell in &row.cells {
-                                let text = format_cell(cell);
-                                // Right-align numerics, left-align text
-                                if cell.is_textual() {
-                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                        ui.label(text);
-                                    });
-                                } else {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(text);
-                                    });
-                                }
+                    // Even-row striping for scanability (transparent on odd rows)
+                    let stripe = if idx % 2 == 0 {
+                        theme.panel
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    egui::Frame::new()
+                        .fill(stripe)
+                        .inner_margin(egui::Margin::symmetric(4, 1))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", idx + 1))
+                                        .small()
+                                        .color(theme.text_faint),
+                                );
                                 ui.separator();
-                            }
-                        } else {
-                            // Row evicted or not yet streamed — placeholder
-                            ui.label("…");
-                        }
-                    });
+                                if let Some(row) = row {
+                                    for cell in &row.cells {
+                                        let text = format_cell(cell);
+                                        // Right-align numerics, left-align text
+                                        if cell.is_textual() {
+                                            ui.with_layout(
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.label(text);
+                                                },
+                                            );
+                                        } else {
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(text);
+                                                },
+                                            );
+                                        }
+                                        ui.separator();
+                                    }
+                                } else {
+                                    // Row evicted or not yet streamed — placeholder
+                                    ui.label("…");
+                                }
+                            });
+                        });
                 }
             });
     });

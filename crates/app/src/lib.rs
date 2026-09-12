@@ -486,6 +486,9 @@ pub struct PgnativeApp {
     /// Connection that Run/Refresh target — set on successful connect, never
     /// guessed from `HashMap` iteration order.
     pub active_connection: Option<ConnectionId>,
+    /// Display name snapshot for the status pill (form name or host/db),
+    /// taken at Connect click time; cleared on disconnect.
+    pub active_connection_name: Option<String>,
     /// Most recent streaming query — Esc/Cancel and Export target this.
     pub active_query: Option<QueryId>,
     /// Connection with an open txn awaiting a commit/rollback/keep-open
@@ -508,9 +511,9 @@ pub struct PgnativeApp {
 impl PgnativeApp {
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Apply theme eagerly
+        // Apply theme eagerly (custom visuals + type scale, not stock)
         let theme = crate::ui::theme::Theme::dark();
-        cc.egui_ctx.set_visuals(theme.visuals());
+        theme.apply(&cc.egui_ctx);
 
         // Restore UI state: default immediately; load persisted state off UI thread.
         let ui_state = crate::ui::layout::UiState::default();
@@ -577,6 +580,7 @@ impl PgnativeApp {
             connection_form: crate::ui::connections::ConnectionForm::default(),
             connect_error: None,
             active_connection: None,
+            active_connection_name: None,
             active_query: None,
             pending_disconnect: None,
             last_completed_query: None,
@@ -603,6 +607,7 @@ impl PgnativeApp {
                     if state == "disconnected" {
                         if self.active_connection == Some(id) {
                             self.active_connection = None;
+                            self.active_connection_name = None;
                         }
                         if self.pending_disconnect == Some(id) {
                             self.pending_disconnect = None;
@@ -700,32 +705,41 @@ impl PgnativeApp {
     fn tx_badge_text(&self) -> Option<(String, egui::Color32)> {
         // Derive from canonical ConnectionState::tx() plus AppState::tx fallback.
         let state = self.controller.state.read();
-        for cs in state.connections.values() {
-            if let Some(tx) = cs.tx_state() {
-                match tx {
-                    TxState::Idle => {}
-                    TxState::InTransaction { .. } => {
-                        return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
-                    }
-                    TxState::InFailedTransaction => {
-                        return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
-                    }
-                }
-            }
+        let in_tx = state.connections.values().any(|cs| {
+            matches!(
+                cs.tx_state(),
+                Some(TxState::InTransaction { .. }) | Some(TxState::InFailedTransaction)
+            )
+        }) || state.tx.values().any(|tx| {
+            matches!(
+                tx,
+                TxState::InTransaction { .. } | TxState::InFailedTransaction
+            )
+        });
+        drop(state);
+        if !in_tx {
+            return None;
         }
-        // Fallback to explicit tx map (covers optimistic classify_tx before ReadyForQuery)
-        for tx in state.tx.values() {
-            match tx {
-                TxState::InTransaction { .. } => {
-                    return Some(("TX".to_string(), egui::Color32::from_rgb(70, 180, 90)));
-                }
-                TxState::InFailedTransaction => {
-                    return Some(("TX ERR".to_string(), egui::Color32::from_rgb(220, 60, 60)));
-                }
-                TxState::Idle => {}
-            }
+        // Distinguish failed transactions (red) from clean ones (green).
+        let failed = self
+            .controller
+            .state
+            .read()
+            .connections
+            .values()
+            .any(|cs| matches!(cs.tx_state(), Some(TxState::InFailedTransaction)))
+            || self
+                .controller
+                .state
+                .read()
+                .tx
+                .values()
+                .any(|tx| matches!(tx, TxState::InFailedTransaction));
+        if failed {
+            Some(("TX ERR".to_string(), self.theme.danger))
+        } else {
+            Some(("TX".to_string(), self.theme.success))
         }
-        None
     }
 }
 
@@ -737,22 +751,52 @@ impl eframe::App for PgnativeApp {
         // Keyboard shortcuts (§32): Ctrl+Enter execute, Esc cancel, F5 refresh
         self.handle_shortcuts(&ctx);
 
-        // Top bar: connection + Tx badge + theme toggle
+        // Top bar: brand + connection status pill + Tx badge + actions + theme toggle
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("pgNative").strong());
+                ui.label(egui::RichText::new("pgNative").strong().size(15.0));
+                // Connection status pill — green dot + name when live,
+                // muted dot + "Not connected" otherwise.
+                let dot = if self.active_connection.is_some() {
+                    self.theme.success
+                } else {
+                    self.theme.text_faint
+                };
+                let name = self
+                    .active_connection_name
+                    .clone()
+                    .unwrap_or_else(|| "Not connected".to_string());
+                self.theme
+                    .band()
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 4.0, dot);
+                            ui.label(
+                                egui::RichText::new(name)
+                                    .small()
+                                    .color(self.theme.text_secondary),
+                            );
+                        });
+                    });
                 // Tx badge (§22) — visible when any connection is in transaction
                 if let Some((label, color)) = self.tx_badge_text() {
-                    let badge = egui::RichText::new(label)
-                        .color(egui::Color32::WHITE)
-                        .small()
-                        .strong();
-                    egui::Frame::new()
-                        .fill(color)
-                        .corner_radius(4)
-                        .inner_margin(egui::Margin::symmetric(6, 2))
+                    self.theme
+                        .band()
+                        .corner_radius(egui::CornerRadius::same(10))
                         .show(ui, |ui| {
-                            ui.label(badge);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, color);
+                                ui.label(egui::RichText::new(label).small().strong().color(color));
+                            });
                         });
                 }
                 if ui.button("New Tab").clicked() {
@@ -778,7 +822,7 @@ impl eframe::App for PgnativeApp {
                         } else {
                             crate::ui::theme::Theme::dark()
                         };
-                        ctx.set_visuals(self.theme.visuals());
+                        self.theme.apply(&ctx);
                     }
                 });
             });
@@ -790,7 +834,7 @@ impl eframe::App for PgnativeApp {
             .resizable(true)
             .default_size(260.0)
             .show(ui, |ui| {
-                ui.heading("Explorer");
+                ui.label(self.theme.section_label("Explorer"));
                 ui.text_edit_singleline(&mut self.ui_state.search);
                 let model_ref = schema_clone.as_deref();
                 crate::ui::explorer::show_explorer(ui, model_ref, &self.ui_state.search);
@@ -802,7 +846,7 @@ impl eframe::App for PgnativeApp {
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
-                ui.heading("History");
+                ui.label(self.theme.section_label("History"));
                 let resp = ui.text_edit_singleline(&mut self.history_query);
                 if resp.changed() {
                     self.controller.send_command(AppCommand::HistorySearch {
@@ -854,13 +898,17 @@ impl eframe::App for PgnativeApp {
                 if let Some(tab) = self.editor_tabs.get_mut(&tab_id) {
                     let mut content = tab.content.clone();
                     let editor_id = egui::Id::new(("sql-editor", tab.id.clone()));
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut content)
-                            .id(editor_id)
-                            .desired_rows(12)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("SELECT * FROM ..."),
-                    );
+                    let resp = self.theme.card().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut content)
+                                .id(editor_id)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(12)
+                                .desired_width(f32::INFINITY)
+                                .frame(egui::Frame::NONE)
+                                .hint_text("SELECT * FROM …"),
+                        )
+                    }).inner;
                     if resp.changed() {
                         tab.content = content;
                         tab.cursor = tab.content.len();
@@ -941,23 +989,61 @@ impl eframe::App for PgnativeApp {
                             );
                             if !completions.is_empty() {
                                 let mut picked: Option<(usize, String)> = None;
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    for (idx, item) in completions.iter().take(8).enumerate() {
-                                        if ui
-                                            .selectable_label(
-                                                false,
-                                                format!("{}  ({:?})", item.label, item.kind)
-                                                    .to_ascii_lowercase(),
-                                            )
-                                            .clicked()
-                                        {
-                                            picked = Some((idx, item.insert_text.clone()));
+                                egui::Frame::new()
+                                    .fill(self.theme.elevated)
+                                    .stroke(egui::Stroke::new(1.0, self.theme.accent))
+                                    .corner_radius(egui::CornerRadius::same(
+                                        self.theme.radius_md,
+                                    ))
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        for (idx, item) in completions.iter().take(8).enumerate() {
+                                            let kind_color = match item.kind {
+                                                pgnative_schema::completion::CompletionKind::Column => {
+                                                    self.theme.accent
+                                                }
+                                                pgnative_schema::completion::CompletionKind::Table => {
+                                                    self.theme.success
+                                                }
+                                                pgnative_schema::completion::CompletionKind::Schema => {
+                                                    self.theme.warn
+                                                }
+                                                pgnative_schema::completion::CompletionKind::Function => {
+                                                    self.theme.text_secondary
+                                                }
+                                            };
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        false,
+                                                        egui::RichText::new(&item.label).strong(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    picked =
+                                                        Some((idx, item.insert_text.clone()));
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{:?}",
+                                                        item.kind
+                                                    ))
+                                                    .small()
+                                                    .color(kind_color),
+                                                );
+                                            });
                                         }
-                                    }
-                                    if completions.len() > 8 {
-                                        ui.label(format!("+{} more…", completions.len() - 8));
-                                    }
-                                });
+                                        if completions.len() > 8 {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "+{} more…",
+                                                    completions.len() - 8
+                                                ))
+                                                .small()
+                                                .color(self.theme.text_faint),
+                                            );
+                                        }
+                                    });
                                 // Splice insert_text over the typed prefix.
                                 if let Some((_, insert)) = picked {
                                     let replace_start = cursor_bytes.saturating_sub(prefix.len());
@@ -971,7 +1057,10 @@ impl eframe::App for PgnativeApp {
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Run (Ctrl+Enter)").clicked() {
+                        if ui
+                            .add(self.theme.primary_button("Run (Ctrl+Enter)"))
+                            .clicked()
+                        {
                             if let Some(conn_id) = self.active_connection {
                                 self.controller.send_command(AppCommand::Execute {
                                     tab: tab.id.clone(),
@@ -1007,12 +1096,14 @@ impl eframe::App for PgnativeApp {
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
             // Show via ui/results helper (ScrollArea::show_rows internally)
-            crate::ui::results::show_results(ui, &mut self.viewport, &snap, &columns);
-            ui.label(format!(
-                "rows: {} total (state: {:?})",
-                snap.rows.len(),
-                snap.state
-            ));
+            crate::ui::results::show_results(ui, &mut self.viewport, &snap, &columns, &self.theme);
+            self.theme.band().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} rows · {:?}", snap.total, snap.state))
+                        .small()
+                        .color(self.theme.text_secondary),
+                );
+            });
             // Minimal CSV export (§28): buffered rows → temp-dir file via runtime.
             // JSON/SQL formats stay unwired until demanded (no fake buttons).
             ui.horizontal(|ui| {
@@ -1042,13 +1133,22 @@ impl eframe::App for PgnativeApp {
             ui.collapsing("Connections", |ui| {
                 crate::ui::connections::show_connections(ui, &mut self.connection_form);
                 if let Some(err) = &self.connect_error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                    ui.colored_label(self.theme.danger, err);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
+                    if ui.add(self.theme.primary_button("Connect")).clicked() {
+                        let display_name = if self.connection_form.name.trim().is_empty() {
+                            format!(
+                                "{} / {}",
+                                self.connection_form.host, self.connection_form.dbname
+                            )
+                        } else {
+                            self.connection_form.name.clone()
+                        };
                         match build_connection_from_form(&self.connection_form) {
                             Ok((cfg, password)) => {
                                 self.connect_error = None;
+                                self.active_connection_name = Some(display_name);
                                 persist_connection(&cfg, password.as_ref());
                                 self.controller.send_command(AppCommand::ConnectDirect {
                                     config: cfg,
@@ -1082,11 +1182,17 @@ impl eframe::App for PgnativeApp {
                          Disconnecting must commit it, roll it back, or wait.",
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("Commit + disconnect").clicked() {
+                        if ui
+                            .add(self.theme.primary_button("Commit + disconnect"))
+                            .clicked()
+                        {
                             self.controller
                                 .send_command(AppCommand::ResolveTransaction { id, commit: true });
                         }
-                        if ui.button("Rollback + disconnect").clicked() {
+                        if ui
+                            .add(self.theme.danger_button("Rollback + disconnect"))
+                            .clicked()
+                        {
                             self.controller
                                 .send_command(AppCommand::ResolveTransaction { id, commit: false });
                         }
