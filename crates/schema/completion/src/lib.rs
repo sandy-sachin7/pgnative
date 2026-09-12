@@ -685,4 +685,62 @@ mod tests {
         let items = engine.complete("us", &HashMap::new(), None);
         assert!(items.iter().any(|i| i.label == "users"));
     }
+
+    #[test]
+    fn completion_alias_dot_suggests_columns() {
+        use pgnative_schema_model::column::Column;
+        use pgnative_schema_model::types::{Nullability, ValueSource};
+
+        let mut b = Builder::new();
+        let sid = b.add_schema(Schema {
+            id: Id(0),
+            name: "public".into(),
+            comment: None,
+        });
+        let mkcol = |id: u32, name: &str| Column {
+            id: Id(id),
+            owner: Id(0),
+            name: name.into(),
+            position: id as u16 + 1,
+            ty: Id(0),
+            nullability: Nullability::Nullable,
+            has_default: false,
+            default_expr: None,
+            value_source: ValueSource::Stored,
+        };
+        b.add_relation(Relation {
+            id: Id(0),
+            schema: sid,
+            oid: Oid(1),
+            name: "users".into(),
+            kind: RelationKind::Table,
+            columns: vec![mkcol(0, "id"), mkcol(1, "email")],
+            primary_key: None,
+            unique_keys: vec![],
+            foreign_keys_out: vec![],
+            foreign_keys_in: vec![],
+            comment: None,
+        });
+        let m = b.build();
+        let engine = CompletionEngine::new(&m);
+
+        // Core §14 promise: `SELECT u. FROM users u` offers users columns.
+        // (Alias extraction scans text up to `cursor`; callers pass the full
+        // buffer with cursor at end, or the caret position in a complete query.)
+        let sql = "SELECT u. FROM users u";
+        let aliases = extract_aliases_with_model(sql, sql.len(), &m);
+        let items = engine.complete("", &aliases, Some("u"));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "id" && i.kind == CompletionKind::Column),
+            "alias u. should suggest id, got {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert!(items.iter().any(|i| i.label == "email"));
+
+        // Table name itself (incl. schema-qualified style lookup) also resolves.
+        let items = engine.complete("", &aliases, Some("users"));
+        assert!(items.iter().any(|i| i.label == "email"));
+    }
 }

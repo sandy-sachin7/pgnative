@@ -87,3 +87,45 @@ pub fn delete_password(conn_id: Uuid) -> Result<(), KeychainError> {
 pub fn sanitize_url(raw: &str) -> String {
     pgnative_db_connection::sanitize_url(raw)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+
+    #[test]
+    fn sanitize_url_never_leaks_password() {
+        let clean = sanitize_url("postgres://bob:s3cret-pw@db.example:5432/mydb");
+        assert!(!clean.contains("s3cret-pw"), "got: {clean}");
+        assert!(clean.contains("db.example"));
+    }
+
+    #[test]
+    fn unavailable_message_mapping() {
+        assert!(is_unavailable_msg(
+            "No default keychain (DBus secret service down)"
+        ));
+        assert!(is_unavailable_msg("platform secure storage failure"));
+        assert!(!is_unavailable_msg("invalid password"));
+        assert!(on_keychain_unavailable(CredentialPolicy::Block).contains("Ask each session"));
+    }
+
+    /// Best-effort OS roundtrip: passes with a real backend (value matches)
+    /// or without one (`Unavailable`, e.g. CI with no Secret Service).
+    /// Any other outcome — wrong value, unexpected error — fails.
+    #[test]
+    fn roundtrip_or_unavailable() {
+        let id = Uuid::new_v4();
+        let pw = SecretString::new("p5-probe-secret".into());
+        match set_password(id, pw) {
+            Ok(()) => {
+                let back = get_password(id).expect("set succeeded, get must succeed");
+                assert_eq!(back.expose_secret(), "p5-probe-secret");
+                delete_password(id).expect("delete must succeed after set");
+                assert!(matches!(get_password(id), Err(KeychainError::NotFound)));
+            }
+            Err(KeychainError::Unavailable { .. }) => {}
+            Err(e) => panic!("unexpected keychain error: {e}"),
+        }
+    }
+}

@@ -170,6 +170,80 @@ async fn portal_window_fetch_without_offset_rewrite() {
     drop(_container);
 }
 
+/// P5: 100k-row windowed fetch — ordered, bounded store, session reusable.
+/// Catches OOM/backpressure regressions before users do (§15 §16 §36.4).
+#[tokio::test]
+async fn portal_window_fetch_100k_bounded() {
+    let Some((host, port, dbname, username, password, _container)) = pg_params().await else {
+        eprintln!("SKIP: no TEST_PG_URL and Docker not available");
+        return;
+    };
+    let sess = live_session(host, port, dbname, username, password).await;
+    let client = &sess.client;
+
+    let user_sql = "SELECT g AS id FROM generate_series(1, 100000) g ORDER BY g";
+    let portal_name = format!("pgnative_portal_{}", Uuid::new_v4().simple());
+    let mut portal = pgnative_results_portal::declare_portal(client, &portal_name, user_sql)
+        .await
+        .expect("declare_portal");
+
+    // Feed every window through a real bounded store (default 50k row budget).
+    let mut store =
+        pgnative_results_store::ResultStore::new(pgnative_results_store::StoreConfig::default());
+    let cap = pgnative_results_stream::PER_CELL_CAP;
+    let window = 1000usize;
+    let mut total = 0u64;
+    let mut prev = 0i64;
+    let mut windows = 0usize;
+    loop {
+        let (rows, exhausted) =
+            pgnative_results_portal::fetch_forward(client, &mut portal, window, cap)
+                .await
+                .expect("fetch_forward");
+        windows += 1;
+        for r in &rows {
+            let id = match &r.cells[0] {
+                pgnative_results_value::CellValue::Int(v) => *v as i64,
+                pgnative_results_value::CellValue::SmallInt(v) => *v as i64,
+                pgnative_results_value::CellValue::BigInt(v) => *v,
+                other => panic!("unexpected id cell {other:?}"),
+            };
+            assert!(id > prev, "ORDER BY g preserved across windows");
+            prev = id;
+            total += 1;
+        }
+        store.push_batch(rows);
+        if exhausted {
+            break;
+        }
+        assert!(
+            windows < 120,
+            "100k rows / 1k window should take ~101 fetches"
+        );
+    }
+    assert_eq!(total, 100_000);
+    assert_eq!(prev, 100_000);
+    // Bounded: every row flowed through, memory stayed within budget.
+    assert_eq!(store.total_pushed(), 100_000);
+    assert!(
+        store.len() <= 50_000,
+        "store must evict past the 50k row budget, got {}",
+        store.len()
+    );
+
+    pgnative_results_portal::close_portal(client, &mut portal)
+        .await
+        .expect("close_portal");
+    let rows = client
+        .query("SELECT 42::int4 AS n", &[])
+        .await
+        .expect("post-close query");
+    let n: i32 = rows[0].get("n");
+    assert_eq!(n, 42);
+
+    drop(_container);
+}
+
 #[tokio::test]
 async fn portal_zero_window_and_rollback() {
     let Some((host, port, dbname, username, password, _container)) = pg_params().await else {
