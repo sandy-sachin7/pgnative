@@ -106,7 +106,11 @@ pub fn insert(conn: &Connection, e: &HistoryEntry) -> Result<(), HistoryError> {
 }
 
 pub fn search(conn: &Connection, q: &str) -> Result<Vec<HistoryEntry>, HistoryError> {
-    // §24: cap + sanitize FTS5 query — raw user input with NEAR/OR/\" can DoS
+    // Empty query → most recent entries so the panel has value on day one.
+    if q.trim().is_empty() {
+        return recent(conn, 20);
+    }
+    // §24: cap + sanitize FTS5 query — raw user input with NEAR/OR/" can DoS
     let q = {
         let mut s = q.chars().take(200).collect::<String>();
         // Escape double-quotes for FTS5 phrase; if syntax still invalid, caller
@@ -123,6 +127,30 @@ pub fn search(conn: &Connection, q: &str) -> Result<Vec<HistoryEntry>, HistoryEr
          WHERE history_fts MATCH ?1 ORDER BY rank LIMIT 50"
     )?;
     let rows = stmt.query_map(params![q], |row| {
+        let id_str: String = row.get(0)?;
+        let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil());
+        Ok(HistoryEntry {
+            id,
+            connection_id: row.get(1)?,
+            query_text: row.get(2)?,
+            executed_at: DateTime::from_timestamp_millis(row.get::<_, i64>(3)?)
+                .unwrap_or_else(Utc::now),
+            duration_ms: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+            rows_affected: row.get(5)?,
+            success: row.get::<_, i64>(6)? != 0,
+            error_code: row.get(7)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Most recent entries, newest first — powers the empty-query history panel.
+pub fn recent(conn: &Connection, limit: u32) -> Result<Vec<HistoryEntry>, HistoryError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, connection_id, query_text, executed_at, duration_ms, rows_affected, success, error_code
+         FROM history ORDER BY executed_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
         let id_str: String = row.get(0)?;
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil());
         Ok(HistoryEntry {
@@ -160,5 +188,28 @@ mod tests {
         insert(&conn, &e).unwrap();
         let results = search(&conn, "users").unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn empty_query_returns_recents_newest_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        for (i, text) in ["SELECT 1", "SELECT 2"].iter().enumerate() {
+            let e = HistoryEntry {
+                id: Uuid::new_v4(),
+                connection_id: "c1".into(),
+                query_text: (*text).into(),
+                executed_at: DateTime::from_timestamp_millis(1_000 + i as i64).unwrap(),
+                duration_ms: None,
+                rows_affected: None,
+                success: true,
+                error_code: None,
+            };
+            insert(&conn, &e).unwrap();
+        }
+        let results = search(&conn, "").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].query_text, "SELECT 2");
+        assert_eq!(results[1].query_text, "SELECT 1");
     }
 }

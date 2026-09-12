@@ -528,14 +528,27 @@ impl PgnativeApp {
             });
         }
 
+        // Populate history panel with recents on launch (empty query → recents).
+        // Harmless if no runtime is running: the command just sits undrained.
+        controller.send_command(AppCommand::HistorySearch {
+            query: String::new(),
+        });
+
+        // First frame is usable immediately: one tab with a starter query
+        // so the user can connect and hit Ctrl+Enter without setup.
+        let mut editor_tabs = HashMap::new();
+        let mut first_tab = pgnative_ui_editor::EditorTab::new("tab-1");
+        first_tab.content = "-- Connect above, then Ctrl+Enter to run\nSELECT 1;".to_string();
+        editor_tabs.insert("tab-1".to_string(), first_tab);
+
         Self {
             controller,
             ui_state,
             viewport: pgnative_results_viewport::ViewportState::default(),
             theme,
             schema: None,
-            editor_tabs: HashMap::new(),
-            active_tab: None,
+            editor_tabs,
+            active_tab: Some("tab-1".to_string()),
             history_query: String::new(),
             history_results: Vec::new(),
             connection_form: pgnative_ui_connections::ConnectionForm::default(),
@@ -629,15 +642,7 @@ impl PgnativeApp {
         }
         // F5 → refresh schema
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            if let Some(conn_id) = self
-                .controller
-                .state
-                .read()
-                .connections
-                .keys()
-                .next()
-                .copied()
-            {
+            if let Some(conn_id) = self.active_connection {
                 self.controller.send_command(AppCommand::RefreshSchema {
                     connection: conn_id,
                 });
@@ -713,15 +718,7 @@ impl eframe::App for PgnativeApp {
                     });
                 }
                 if ui.button("Refresh Schema").clicked() {
-                    if let Some(id) = self
-                        .controller
-                        .state
-                        .read()
-                        .connections
-                        .keys()
-                        .next()
-                        .copied()
-                    {
+                    if let Some(id) = self.active_connection {
                         self.controller
                             .send_command(AppCommand::RefreshSchema { connection: id });
                     }
@@ -752,8 +749,9 @@ impl eframe::App for PgnativeApp {
                 pgnative_ui_explorer::show_explorer(ui, model_ref, &self.ui_state.search);
             });
 
-        // Right: history panel (FTS) — driven by HistorySearch command
-        egui::Panel::right("history")
+        // Right: history panel (FTS) — driven by HistorySearch command.
+        // Clicking an entry loads it into the editor and re-runs it when connected.
+        let picked = egui::Panel::right("history")
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
@@ -768,8 +766,31 @@ impl eframe::App for PgnativeApp {
                     ui,
                     &self.history_query,
                     &self.history_results,
-                );
-            });
+                )
+            })
+            .inner;
+        if let Some(sql) = picked {
+            let tab_id = match self.active_tab.clone() {
+                Some(id) => id,
+                None => {
+                    let id = format!("tab-{}", self.editor_tabs.len() + 1);
+                    self.editor_tabs
+                        .insert(id.clone(), pgnative_ui_editor::EditorTab::new(id.clone()));
+                    self.active_tab = Some(id.clone());
+                    id
+                }
+            };
+            if let Some(tab) = self.editor_tabs.get_mut(&tab_id) {
+                tab.content = sql.clone();
+            }
+            if let Some(conn_id) = self.active_connection {
+                self.controller.send_command(AppCommand::Execute {
+                    tab: tab_id,
+                    sql,
+                    connection: conn_id,
+                });
+            }
+        }
 
         // Central: editor tabs + virtualized results grid
         egui::CentralPanel::default().show(ui, |ui| {
@@ -895,8 +916,9 @@ impl eframe::App for PgnativeApp {
             // Size the snapshot window from the available height so the
             // scrolled-to rows are actually resident; the grid reports back
             // the visible range for the next frame (see show_results).
-            let visible =
-                (ui.available_height() / self.viewport.row_height).ceil().max(1.0) as usize;
+            let visible = (ui.available_height() / self.viewport.row_height)
+                .ceil()
+                .max(1.0) as usize;
             self.viewport.len = visible + 2 * self.viewport.overscan;
             let store_guard = self.store.read();
             // Columns + rows under one read lock so header and body agree.

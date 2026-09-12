@@ -238,9 +238,8 @@ async fn runtime_connect_execute_cancel_via_appcommand() {
         std::mem::forget(sess);
     }
 
-    // Clear store before next query to assert exact count
-    // (store is cumulative; we check delta)
-    let before_len = store.read().len();
+    // Execute clears the store (§15 bounded window): the finished query's
+    // rows must be exactly the fixture rows, not a cumulative delta.
     cmd_tx
         .send(AppCommand::Execute {
             tab: "t1".into(),
@@ -256,10 +255,11 @@ async fn runtime_connect_execute_cancel_via_appcommand() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     {
         let g = store.read();
-        let delta = g.len().saturating_sub(before_len);
         assert_eq!(
-            delta, 100,
-            "fixture query should add 100 rows to store (got {delta})"
+            g.len(),
+            100,
+            "fixture query should leave exactly 100 rows in store (got {})",
+            g.len()
         );
     }
 
