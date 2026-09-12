@@ -483,6 +483,10 @@ pub struct PgnativeApp {
     pub connection_form: crate::ui::connections::ConnectionForm,
     /// Last connection error, shown inline in the connections panel.
     pub connect_error: Option<String>,
+    /// Last query/transaction error, shown as a banner above the results
+    /// grid. E2E proved `Error{op:execute}` otherwise only hits the log,
+    /// leaving the user staring at stale rows with zero feedback.
+    pub query_error: Option<String>,
     /// Connection that Run/Refresh target — set on successful connect, never
     /// guessed from `HashMap` iteration order.
     pub active_connection: Option<ConnectionId>,
@@ -579,6 +583,7 @@ impl PgnativeApp {
             history_results: Vec::new(),
             connection_form: crate::ui::connections::ConnectionForm::default(),
             connect_error: None,
+            query_error: None,
             active_connection: None,
             active_connection_name: None,
             active_query: None,
@@ -632,6 +637,13 @@ impl PgnativeApp {
                         if op == "export" {
                             self.export_status = Some(message.clone());
                         }
+                        // Query/txn failures must surface in the central
+                        // panel — warn-only leaves stale rows on screen.
+                        // ("query" is the runtime's op for failed Execute;
+                        // "execute" covers the not-connected guard.)
+                        if op == "execute" || op == "query" || op == "commit" || op == "rollback" {
+                            self.query_error = Some(message.clone());
+                        }
                         tracing::warn!(op = %op, message = %message, "app error");
                     }
                 }
@@ -646,8 +658,10 @@ impl PgnativeApp {
                 }
                 AppEvent::QueryProgress { query_id, .. } => {
                     self.active_query = Some(query_id);
-                    // A new stream invalidates the previous finished result.
+                    // A new stream invalidates the previous finished result
+                    // and any previous error banner.
                     self.last_completed_query = None;
+                    self.query_error = None;
                 }
                 AppEvent::QueryFinished {
                     query_id, success, ..
@@ -657,6 +671,7 @@ impl PgnativeApp {
                     }
                     if success {
                         self.last_completed_query = Some(query_id);
+                        self.query_error = None;
                     }
                 }
                 AppEvent::ExportProgress { written, path, .. } => {
@@ -1124,6 +1139,15 @@ impl eframe::App for PgnativeApp {
 
             ui.separator();
 
+            // Query/txn failure banner — without this a failed query leaves
+            // stale rows on screen and the error only in the log.
+            if let Some(err) = self.query_error.clone() {
+                let theme = &self.theme;
+                theme.band().show(ui, |ui| {
+                    ui.label(egui::RichText::new(err).color(theme.danger));
+                });
+            }
+
             // Virtualized results — only visible + overscan rows (§18).
             // Size the snapshot window from the available height so the
             // scrolled-to rows are actually resident; the grid reports back
@@ -1223,6 +1247,17 @@ impl Drop for PgnativeApp {
 /// Uses `directories` for storage path, Tokio runtime re-used from `eframe`
 /// winit loop where available. Returns `eframe::Result` for caller (e.g. `main.rs`).
 pub fn run_native() -> eframe::Result<()> {
+    // The AppRuntime dispatcher needs a Tokio context: eframe's UI thread has
+    // none, so `Handle::try_current()` in `PgnativeApp::new` would fail, the
+    // command channel would never be drained, and every Connect/Run/Cancel
+    // would silently go nowhere (found by E2E: zero events, zero PG backends).
+    // Enter a runtime here and keep it alive for the whole window lifetime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("pgnative-tokio")
+        .build()
+        .expect("tokio runtime for AppRuntime dispatcher");
+    let _guard = rt.enter();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

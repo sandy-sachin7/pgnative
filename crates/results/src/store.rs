@@ -110,6 +110,13 @@ impl ResultStore {
         };
     }
 
+    /// Terminal failure: the query errored, so the status line must not
+    /// keep reading `Streaming`. (Previously no path ever set
+    /// `StoreState::Error` — failed queries looked in-flight forever.)
+    pub fn fail(&mut self) {
+        self.state = StoreState::Error;
+    }
+
     #[must_use]
     pub fn snapshot_range(&self, offset: usize, len: usize) -> Arc<[Row]> {
         let end = (offset + len).min(self.rows.len());
