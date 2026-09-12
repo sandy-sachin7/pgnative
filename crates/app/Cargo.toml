@@ -31,6 +31,7 @@ pgnative-schema-model = { path = "../schema/model" }
 pgnative-schema-completion = { path = "../schema/completion" }
 pgnative-results-value = { path = "../results/value" }
 pgnative-results-store = { path = "../results/store" }
+pgnative-results-export = { path = "../results/export" }
 pgnative-results-viewport = { path = "../results/viewport" }
 pgnative-db-connection = { path = "../db/connection" }
 pgnative-db-introspection = { path = "../db/introspection" }

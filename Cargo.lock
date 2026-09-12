@@ -3256,6 +3256,7 @@ dependencies = [
  "parking_lot",
  "pgnative-db-connection",
  "pgnative-db-introspection",
+ "pgnative-results-export",
  "pgnative-results-portal",
  "pgnative-results-store",
  "pgnative-results-stream",
