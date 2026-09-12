@@ -6,11 +6,11 @@
 
 use std::time::Duration;
 
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
-use pgnative_results_stream::{
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, SslMode};
+use pgnative_results::stream::{
     channel, column_meta_from_pg, drive_stream, ColumnMeta, StreamConfig, StreamEvent,
 };
-use pgnative_results_value::CellValue;
+use pgnative_results::value::CellValue;
 use secrecy::SecretString;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -65,7 +65,7 @@ async fn live_session(
     dbname: String,
     username: String,
     password: String,
-) -> pgnative_db_connection::LiveSession {
+) -> pgnative_db::connection::LiveSession {
     let cfg = ConnectionConfig {
         id: ConnectionId(Uuid::new_v4()),
         name: "pg_types".into(),
@@ -78,14 +78,14 @@ async fn live_session(
         ssh_tunnel: None,
     };
     let pw = SecretString::new(password.into());
-    pgnative_db_connection::connect_live(&cfg, Some(&pw))
+    pgnative_db::connection::connect_live(&cfg, Some(&pw))
         .await
         .expect("connect_live")
 }
 
 /// Collect one result row's cells via `drive_stream` for a given SQL.
 async fn collect_one_row(
-    sess: &pgnative_db_connection::LiveSession,
+    sess: &pgnative_db::connection::LiveSession,
     sql: &str,
 ) -> (Vec<ColumnMeta>, Vec<CellValue>) {
     let cfg = StreamConfig {
@@ -250,7 +250,7 @@ async fn pg_type_matrix_live() {
         let inet: String = row.get("inet");
         let cidr: String = row.get("cidr");
         // decode via correct OIDs (proves CellValue variant without binary portal)
-        use pgnative_results_stream::decode_cell;
+        use pgnative_results::stream::decode_cell;
         assert!(matches!(
             decode_cell(Some(n.as_bytes()), 1700),
             CellValue::Numeric(_)

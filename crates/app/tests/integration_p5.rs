@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pgnative_app::{AppCommand, AppEvent, AppState};
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
-use pgnative_results_edit::{update_sql_optimistic, update_sql_with_pk, ColumnDiff};
-use pgnative_results_store::{ResultStore, SharedStore, StoreConfig};
-use pgnative_schema_model::column::Column;
-use pgnative_schema_model::relation::{PrimaryKey, Relation};
-use pgnative_schema_model::types::{Id, Nullability, Oid, RelationKind, ValueSource};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, SslMode};
+use pgnative_results::edit::{update_sql_optimistic, update_sql_with_pk, ColumnDiff};
+use pgnative_results::store::{ResultStore, SharedStore, StoreConfig};
+use pgnative_schema::model::column::Column;
+use pgnative_schema::model::relation::{PrimaryKey, Relation};
+use pgnative_schema::model::types::{Id, Nullability, Oid, RelationKind, ValueSource};
 use secrecy::SecretString;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -141,7 +141,7 @@ async fn launch(parts: &PgParts) -> Harness {
     }
 }
 
-async fn setup_client(parts: &PgParts) -> pgnative_db_connection::LiveSession {
+async fn setup_client(parts: &PgParts) -> pgnative_db::connection::LiveSession {
     let (host, port, dbname, username, password, _) = parts;
     let cfg = ConnectionConfig {
         id: ConnectionId(Uuid::new_v4()),
@@ -154,7 +154,7 @@ async fn setup_client(parts: &PgParts) -> pgnative_db_connection::LiveSession {
         ssl_root_cert: None,
         ssh_tunnel: None,
     };
-    pgnative_db_connection::connect_live(&cfg, Some(&SecretString::new(password.clone().into())))
+    pgnative_db::connection::connect_live(&cfg, Some(&SecretString::new(password.clone().into())))
         .await
         .expect("setup connect_live")
 }
@@ -307,7 +307,7 @@ async fn edit_live_roundtrip() {
         let found = snap.iter().any(|row| {
             row.cells
                 .iter()
-                .any(|c| matches!(c, pgnative_results_value::CellValue::Text(t) if t == "b"))
+                .any(|c| matches!(c, pgnative_results::value::CellValue::Text(t) if t == "b"))
         });
         assert!(found, "single-PK UPDATE must change exactly row 1 to 'b'");
     }

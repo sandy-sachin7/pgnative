@@ -2,9 +2,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pgnative_db_connection::{connect_live, LiveSession};
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, QueryId, SslMode};
-use pgnative_results_store::SharedStore;
+use pgnative_db::connection::{connect_live, LiveSession};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, QueryId, SslMode};
+use pgnative_results::store::SharedStore;
 
 use crate::{AppCommand, AppEvent, AppState};
 
@@ -96,8 +96,8 @@ pub fn spawn_runtime(
                                 state: "connected".into(),
                             });
                             let client_ref = &sess.client;
-                            let _ = pgnative_db_introspection::prepare_session(client_ref).await;
-                            match pgnative_db_introspection::introspect(client_ref).await {
+                            let _ = pgnative_db::introspection::prepare_session(client_ref).await;
+                            match pgnative_db::introspection::introspect(client_ref).await {
                                 Ok(model) => {
                                     let arc = Arc::new(model);
                                     state.write().set_schema((*arc).clone());
@@ -122,7 +122,7 @@ pub fn spawn_runtime(
                             });
                             state.write().connections.insert(
                                 id,
-                                pgnative_db_connection::ConnectionState::Error {
+                                pgnative_db::connection::ConnectionState::Error {
                                     id: Some(id),
                                     kind: e.to_string(),
                                     retryable: true,
@@ -145,8 +145,8 @@ pub fn spawn_runtime(
                                 state: "connected".into(),
                             });
                             let client_ref = &sess.client;
-                            let _ = pgnative_db_introspection::prepare_session(client_ref).await;
-                            match pgnative_db_introspection::introspect(client_ref).await {
+                            let _ = pgnative_db::introspection::prepare_session(client_ref).await;
+                            match pgnative_db::introspection::introspect(client_ref).await {
                                 Ok(model) => {
                                     let arc = Arc::new(model);
                                     state.write().set_schema((*arc).clone());
@@ -171,7 +171,7 @@ pub fn spawn_runtime(
                             });
                             state.write().connections.insert(
                                 config.id,
-                                pgnative_db_connection::ConnectionState::Error {
+                                pgnative_db::connection::ConnectionState::Error {
                                     id: Some(config.id),
                                     kind: e.to_string(),
                                     retryable: true,
@@ -279,10 +279,10 @@ pub fn spawn_runtime(
                         let stmt_res = client.prepare(&sql_exec).await;
                         let (stmt_metas, stream_res) = match stmt_res {
                             Ok(s) => {
-                                let metas: Vec<pgnative_results_stream::ColumnMeta> = s
+                                let metas: Vec<pgnative_results::stream::ColumnMeta> = s
                                     .columns()
                                     .iter()
-                                    .map(pgnative_results_stream::column_meta_from_pg)
+                                    .map(pgnative_results::stream::column_meta_from_pg)
                                     .collect();
                                 let empty: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
                                 let r = client.query_raw(&s, empty).await;
@@ -303,28 +303,28 @@ pub fn spawn_runtime(
                         match stream_res {
                             Ok(stream) => {
                                 let cols = stmt_metas;
-                                let (tx, mut rx) = pgnative_results_stream::channel(
-                                    &pgnative_results_stream::StreamConfig::default(),
+                                let (tx, mut rx) = pgnative_results::stream::channel(
+                                    &pgnative_results::stream::StreamConfig::default(),
                                 );
                                 // RowStream contains PhantomPinned (!Unpin); pin before drive.
                                 let stream = Box::pin(stream);
-                                let drive = pgnative_results_stream::spawn_drive(
+                                let drive = pgnative_results::stream::spawn_drive(
                                     stream,
                                     cols,
-                                    pgnative_results_stream::StreamConfig::default(),
+                                    pgnative_results::stream::StreamConfig::default(),
                                     tx,
                                 );
                                 let mut total: u64 = 0;
                                 while let Some(ev) = rx.recv().await {
                                     match ev {
-                                        pgnative_results_stream::StreamEvent::Meta(metas) => {
+                                        pgnative_results::stream::StreamEvent::Meta(metas) => {
                                             let names = metas
                                                 .iter()
                                                 .map(|m| m.name.clone())
                                                 .collect::<Vec<_>>();
                                             store_clone.write().set_columns(names);
                                         }
-                                        pgnative_results_stream::StreamEvent::Batch(batch) => {
+                                        pgnative_results::stream::StreamEvent::Batch(batch) => {
                                             let n = batch.len() as u64;
                                             total += n;
                                             {
@@ -335,7 +335,7 @@ pub fn spawn_runtime(
                                                 rows: total,
                                             });
                                         }
-                                        pgnative_results_stream::StreamEvent::Complete {
+                                        pgnative_results::stream::StreamEvent::Complete {
                                             rows,
                                             ..
                                         } => {
@@ -344,7 +344,7 @@ pub fn spawn_runtime(
                                             // update the badge/decision state; authoritative
                                             // correction comes from ReadyForQuery when wired.
                                             if let Some(tx) =
-                                                pgnative_db_connection::classify_tx(&sql_exec)
+                                                pgnative_db::connection::classify_tx(&sql_exec)
                                             {
                                                 tx_state_handle
                                                     .write()
@@ -360,7 +360,7 @@ pub fn spawn_runtime(
                                                     crate::open_app_db(&crate::app_db_path())
                                                 {
                                                     let entry =
-                                                        pgnative_storage_history::HistoryEntry {
+                                                        pgnative_storage::history::HistoryEntry {
                                                             id: uuid::Uuid::new_v4(),
                                                             connection_id: conn_for_history
                                                                 .0
@@ -374,14 +374,14 @@ pub fn spawn_runtime(
                                                             success: true,
                                                             error_code: None,
                                                         };
-                                                    let _ = pgnative_storage_history::insert(
+                                                    let _ = pgnative_storage::history::insert(
                                                         &conn, &entry,
                                                     );
                                                 }
                                             });
                                             break;
                                         }
-                                        pgnative_results_stream::StreamEvent::Error(e) => {
+                                        pgnative_results::stream::StreamEvent::Error(e) => {
                                             store_clone.write().cancel();
                                             let _ = ev_tx.try_send(AppEvent::Error {
                                                 op: "query".into(),
@@ -429,7 +429,7 @@ pub fn spawn_runtime(
                                 entry.cancel.cancel_query(tokio_postgres::NoTls).await
                             }
                             _ => {
-                                match pgnative_db_connection::build_rustls_config(
+                                match pgnative_db::connection::build_rustls_config(
                                     entry.ssl_mode,
                                     entry.ssl_root_cert.as_deref(),
                                 ) {
@@ -448,7 +448,7 @@ pub fn spawn_runtime(
                                         );
                                         if let Some(sess) = sessions.get_mut(&entry.connection) {
                                             sess.health =
-                                                pgnative_db_connection::SessionHealth::Poisoned;
+                                                pgnative_db::connection::SessionHealth::Poisoned;
                                         }
                                         // Treat as cancel failure — poisoned path below will also handle,
                                         // but we short-circuit to avoid fabricating tokio_postgres::Error.
@@ -464,7 +464,7 @@ pub fn spawn_runtime(
                         };
                         if cancel_res.is_err() {
                             if let Some(sess) = sessions.get_mut(&entry.connection) {
-                                sess.health = pgnative_db_connection::SessionHealth::Poisoned;
+                                sess.health = pgnative_db::connection::SessionHealth::Poisoned;
                                 tracing::warn!(
                                     connection = %entry.connection,
                                     "cancel failed — marking session Poisoned (needs reconnect)"
@@ -484,7 +484,7 @@ pub fn spawn_runtime(
                         let state_clone = state.clone();
                         let client = std::sync::Arc::clone(&sess.client);
                         tokio::spawn(async move {
-                            match pgnative_db_introspection::introspect(&client).await {
+                            match pgnative_db::introspection::introspect(&client).await {
                                 Ok(model) => {
                                     let arc = Arc::new(model);
                                     state_clone.write().set_schema((*arc).clone());
@@ -507,8 +507,8 @@ pub fn spawn_runtime(
                     let ev_tx = event_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Ok(conn) = crate::open_app_db(&crate::app_db_path()) {
-                            let res =
-                                pgnative_storage_history::search(&conn, &query).unwrap_or_default();
+                            let res = pgnative_storage::history::search(&conn, &query)
+                                .unwrap_or_default();
                             let results = res.into_iter().map(|e| e.query_text).collect::<Vec<_>>();
                             // Prefer typed HistoryResults; keep Error fallback for old listeners
                             let _ = ev_tx.try_send(AppEvent::HistoryResults {
@@ -542,7 +542,7 @@ pub fn spawn_runtime(
                             let guard = store_clone.read();
                             (guard.columns(), guard.snapshot_range(0, guard.len()))
                         };
-                        let csv = match pgnative_results_export::export_csv(&rows, &columns) {
+                        let csv = match pgnative_results::export::export_csv(&rows, &columns) {
                             Ok(csv) => csv,
                             Err(e) => {
                                 let _ = ev_tx.try_send(AppEvent::Error {
@@ -582,7 +582,7 @@ fn load_connection_config(id: ConnectionId) -> Option<ConnectionConfig> {
     let path = crate::app_db_path();
     let conn = crate::open_app_db(&path).ok()?;
     let sc = load_saved(&conn, &id.0.to_string())?;
-    let ssl_mode = pgnative_db_connection::ssl_mode_from_str(&sc.ssl_mode);
+    let ssl_mode = pgnative_db::connection::ssl_mode_from_str(&sc.ssl_mode);
     Some(ConnectionConfig {
         id,
         name: sc.name,
@@ -599,13 +599,13 @@ fn load_connection_config(id: ConnectionId) -> Option<ConnectionConfig> {
 fn load_saved(
     conn: &rusqlite::Connection,
     id: &str,
-) -> Option<pgnative_storage_connections::SavedConnection> {
+) -> Option<pgnative_storage::connections::SavedConnection> {
     let mut stmt = conn
         .prepare("SELECT id,name,host,port,dbname,username,ssl_mode FROM connections WHERE id=?1")
         .ok()?;
     let mut rows = stmt.query([id]).ok()?;
     let row = rows.next().ok()??;
-    Some(pgnative_storage_connections::SavedConnection {
+    Some(pgnative_storage::connections::SavedConnection {
         id: row.get(0).ok()?,
         name: row.get(1).ok()?,
         host: row.get(2).ok()?,

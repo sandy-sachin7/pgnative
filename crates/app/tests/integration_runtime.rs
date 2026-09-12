@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pgnative_app::{AppCommand, AppEvent, AppState, ExportFormat};
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
-use pgnative_results_store::{ResultStore, SharedStore, StoreConfig};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, SslMode};
+use pgnative_results::store::{ResultStore, SharedStore, StoreConfig};
 use secrecy::SecretString;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -184,7 +184,7 @@ async fn runtime_connect_execute_cancel_via_appcommand() {
         let found = snap.iter().any(|row| {
             row.cells
                 .iter()
-                .any(|c| matches!(c, pgnative_results_value::CellValue::Int(1)))
+                .any(|c| matches!(c, pgnative_results::value::CellValue::Int(1)))
         });
         assert!(found, "store should contain Int(1) from SELECT 1");
     }
@@ -208,7 +208,7 @@ async fn runtime_connect_execute_cancel_via_appcommand() {
             ssh_tunnel: None,
         };
         let setup_pw = SecretString::new(password.clone().into());
-        let sess = pgnative_db_connection::connect_live(&setup_cfg, Some(&setup_pw))
+        let sess = pgnative_db::connection::connect_live(&setup_cfg, Some(&setup_pw))
             .await
             .expect("setup connect");
         sess.client

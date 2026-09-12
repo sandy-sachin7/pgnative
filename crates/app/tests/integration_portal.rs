@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use pgnative_db_connection::{ConnectionConfig, ConnectionId, SslMode};
+use pgnative_db::connection::{ConnectionConfig, ConnectionId, SslMode};
 use secrecy::SecretString;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -58,7 +58,7 @@ async fn live_session(
     dbname: String,
     username: String,
     password: String,
-) -> pgnative_db_connection::LiveSession {
+) -> pgnative_db::connection::LiveSession {
     let cfg = ConnectionConfig {
         id: ConnectionId(Uuid::new_v4()),
         name: "portal_test".into(),
@@ -71,7 +71,7 @@ async fn live_session(
         ssh_tunnel: None,
     };
     let pw = SecretString::new(password.into());
-    pgnative_db_connection::connect_live(&cfg, Some(&pw))
+    pgnative_db::connection::connect_live(&cfg, Some(&pw))
         .await
         .expect("connect_live")
 }
@@ -91,7 +91,7 @@ async fn portal_window_fetch_without_offset_rewrite() {
     assert!(!user_sql.contains("OFFSET"));
 
     let portal_name = format!("pgnative_portal_{}", Uuid::new_v4().simple());
-    let mut portal = pgnative_results_portal::declare_portal(client, &portal_name, user_sql)
+    let mut portal = pgnative_results::portal::declare_portal(client, &portal_name, user_sql)
         .await
         .expect("declare_portal");
     assert_eq!(portal.columns.len(), 2);
@@ -106,19 +106,19 @@ async fn portal_window_fetch_without_offset_rewrite() {
     let mut all_ids = Vec::new();
     let mut windows = 0usize;
     let window = 100usize;
-    let cap = pgnative_results_stream::PER_CELL_CAP;
+    let cap = pgnative_results::stream::PER_CELL_CAP;
     loop {
         let (rows, exhausted) =
-            pgnative_results_portal::fetch_forward(client, &mut portal, window, cap)
+            pgnative_results::portal::fetch_forward(client, &mut portal, window, cap)
                 .await
                 .expect("fetch_forward");
         windows += 1;
         for r in &rows {
             // id is int4 (oid 23) → CellValue::Int
             let id = match &r.cells[0] {
-                pgnative_results_value::CellValue::Int(v) => *v as i64,
-                pgnative_results_value::CellValue::SmallInt(v) => *v as i64,
-                pgnative_results_value::CellValue::BigInt(v) => *v,
+                pgnative_results::value::CellValue::Int(v) => *v as i64,
+                pgnative_results::value::CellValue::SmallInt(v) => *v as i64,
+                pgnative_results::value::CellValue::BigInt(v) => *v,
                 other => panic!("unexpected id cell {other:?}"),
             };
             all_ids.push(id);
@@ -146,7 +146,7 @@ async fn portal_window_fetch_without_offset_rewrite() {
     }
 
     // After fetching, close and verify session usable (COMMIT happened)
-    pgnative_results_portal::close_portal(client, &mut portal)
+    pgnative_results::portal::close_portal(client, &mut portal)
         .await
         .expect("close_portal");
     assert!(portal.closed);
@@ -159,11 +159,11 @@ async fn portal_window_fetch_without_offset_rewrite() {
     assert_eq!(n, 42);
 
     // Fetch after close must error AlreadyClosed
-    let err = pgnative_results_portal::fetch_forward(client, &mut portal, 10, cap).await;
+    let err = pgnative_results::portal::fetch_forward(client, &mut portal, 10, cap).await;
     assert!(err.is_err(), "fetch after close should fail");
 
     // Second close is idempotent
-    pgnative_results_portal::close_portal(client, &mut portal)
+    pgnative_results::portal::close_portal(client, &mut portal)
         .await
         .expect("second close ok");
 
@@ -183,29 +183,29 @@ async fn portal_window_fetch_100k_bounded() {
 
     let user_sql = "SELECT g AS id FROM generate_series(1, 100000) g ORDER BY g";
     let portal_name = format!("pgnative_portal_{}", Uuid::new_v4().simple());
-    let mut portal = pgnative_results_portal::declare_portal(client, &portal_name, user_sql)
+    let mut portal = pgnative_results::portal::declare_portal(client, &portal_name, user_sql)
         .await
         .expect("declare_portal");
 
     // Feed every window through a real bounded store (default 50k row budget).
     let mut store =
-        pgnative_results_store::ResultStore::new(pgnative_results_store::StoreConfig::default());
-    let cap = pgnative_results_stream::PER_CELL_CAP;
+        pgnative_results::store::ResultStore::new(pgnative_results::store::StoreConfig::default());
+    let cap = pgnative_results::stream::PER_CELL_CAP;
     let window = 1000usize;
     let mut total = 0u64;
     let mut prev = 0i64;
     let mut windows = 0usize;
     loop {
         let (rows, exhausted) =
-            pgnative_results_portal::fetch_forward(client, &mut portal, window, cap)
+            pgnative_results::portal::fetch_forward(client, &mut portal, window, cap)
                 .await
                 .expect("fetch_forward");
         windows += 1;
         for r in &rows {
             let id = match &r.cells[0] {
-                pgnative_results_value::CellValue::Int(v) => *v as i64,
-                pgnative_results_value::CellValue::SmallInt(v) => *v as i64,
-                pgnative_results_value::CellValue::BigInt(v) => *v,
+                pgnative_results::value::CellValue::Int(v) => *v as i64,
+                pgnative_results::value::CellValue::SmallInt(v) => *v as i64,
+                pgnative_results::value::CellValue::BigInt(v) => *v,
                 other => panic!("unexpected id cell {other:?}"),
             };
             assert!(id > prev, "ORDER BY g preserved across windows");
@@ -231,7 +231,7 @@ async fn portal_window_fetch_100k_bounded() {
         store.len()
     );
 
-    pgnative_results_portal::close_portal(client, &mut portal)
+    pgnative_results::portal::close_portal(client, &mut portal)
         .await
         .expect("close_portal");
     let rows = client
@@ -255,19 +255,19 @@ async fn portal_zero_window_and_rollback() {
 
     let portal_name = format!("pgnative_portal_{}", Uuid::new_v4().simple());
     let mut portal =
-        pgnative_results_portal::declare_portal(client, &portal_name, "SELECT 1::int4 AS n")
+        pgnative_results::portal::declare_portal(client, &portal_name, "SELECT 1::int4 AS n")
             .await
             .expect("declare");
 
-    let cap = pgnative_results_stream::PER_CELL_CAP;
-    let (rows, exhausted) = pgnative_results_portal::fetch_forward(client, &mut portal, 0, cap)
+    let cap = pgnative_results::stream::PER_CELL_CAP;
+    let (rows, exhausted) = pgnative_results::portal::fetch_forward(client, &mut portal, 0, cap)
         .await
         .expect("zero fetch");
     assert!(rows.is_empty());
     assert!(!exhausted);
 
     // Rollback path (simulates cancel/error)
-    pgnative_results_portal::rollback_portal(client, &mut portal).await;
+    pgnative_results::portal::rollback_portal(client, &mut portal).await;
     assert!(portal.closed);
     // After rollback, session still usable
     let rows = client
