@@ -1,26 +1,33 @@
 //! Schema tree explorer — filterable, reads Arc<SchemaModel> (§12).
-use pgnative_schema::model::types::RelationKind;
+use pgnative_schema::model::types::{RelationId, RelationKind};
 use pgnative_schema::model::SchemaModel;
 
 /// Render the schema tree: schemas → relations → columns, filtered by `filter`.
 ///
 /// Pure render (§30) — no DB/network/FS. Caller supplies `Arc<SchemaModel>` snapshot.
-pub fn show_explorer(ui: &mut egui::Ui, model: Option<&SchemaModel>, filter: &str) {
+/// Returns the clicked relation to browse (§17: purpose-built browse query, never
+/// arbitrary-SQL identity inference).
+pub fn show_explorer(
+    ui: &mut egui::Ui,
+    model: Option<&SchemaModel>,
+    filter: &str,
+) -> Option<RelationId> {
     let Some(model) = model else {
         ui.label(
             egui::RichText::new("Not connected — no schema")
                 .weak()
                 .italics(),
         );
-        return;
+        return None;
     };
     if model.relations().is_empty() && model.schemas().is_empty() {
         ui.label(egui::RichText::new("No relations").weak());
-        return;
+        return None;
     }
     let lower = filter.to_ascii_lowercase();
     let filter_active = !filter.is_empty();
 
+    let mut picked: Option<RelationId> = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         // Iterate schemas in stable order; fall back to sorted_relations grouping if empty
         let schemas = model.schemas();
@@ -31,32 +38,36 @@ pub fn show_explorer(ui: &mut egui::Ui, model: Option<&SchemaModel>, filter: &st
                 .iter()
                 .filter(|r| !filter_active || r.name.to_ascii_lowercase().contains(&lower))
             {
-                relation_row(ui, model, rel);
+                if relation_row(ui, model, rel).is_some() {
+                    picked = Some(rel.id);
+                }
             }
-            return;
-        }
-        for schema in schemas {
-            let rels: Vec<_> = model
-                .relations_in(schema.id)
-                .iter()
-                .filter_map(|id| model.relation(*id))
-                .filter(|r| !filter_active || r.name.to_ascii_lowercase().contains(&lower))
-                .collect();
-            // When filtering and schema has no matches, hide the group
-            if rels.is_empty() && filter_active {
-                continue;
+        } else {
+            for schema in schemas {
+                let rels: Vec<_> = model
+                    .relations_in(schema.id)
+                    .iter()
+                    .filter_map(|id| model.relation(*id))
+                    .filter(|r| !filter_active || r.name.to_ascii_lowercase().contains(&lower))
+                    .collect();
+                // When filtering and schema has no matches, hide the group
+                if rels.is_empty() && filter_active {
+                    continue;
+                }
+                let header = format!("{}  ({})", schema.name, rels.len());
+                egui::CollapsingHeader::new(header)
+                    .default_open(!filter_active)
+                    .show(ui, |ui| {
+                        if rels.is_empty() {
+                            ui.label(egui::RichText::new("(empty)").weak().small());
+                        }
+                        for rel in rels {
+                            if relation_row(ui, model, rel).is_some() {
+                                picked = Some(rel.id);
+                            }
+                        }
+                    });
             }
-            let header = format!("{}  ({})", schema.name, rels.len());
-            egui::CollapsingHeader::new(header)
-                .default_open(!filter_active)
-                .show(ui, |ui| {
-                    if rels.is_empty() {
-                        ui.label(egui::RichText::new("(empty)").weak().small());
-                    }
-                    for rel in rels {
-                        relation_row(ui, model, rel);
-                    }
-                });
         }
         // Functions (optional, low noise)
         if !filter_active {
@@ -72,13 +83,14 @@ pub fn show_explorer(ui: &mut egui::Ui, model: Option<&SchemaModel>, filter: &st
             }
         }
     });
+    picked
 }
 
 fn relation_row(
     ui: &mut egui::Ui,
     model: &SchemaModel,
     rel: &pgnative_schema::model::relation::Relation,
-) {
+) -> Option<RelationId> {
     let kind_label = match rel.kind {
         RelationKind::Table => "table",
         RelationKind::View => "view",
@@ -86,7 +98,11 @@ fn relation_row(
         RelationKind::ForeignTable => "foreign",
     };
     let title = format!("{}  [{}]", rel.name, kind_label);
+    let mut browse_clicked = false;
     egui::CollapsingHeader::new(title).show(ui, |ui| {
+        if ui.small_button("Browse").clicked() {
+            browse_clicked = true;
+        }
         if rel.columns.is_empty() {
             ui.label(egui::RichText::new("(no columns)").weak().small());
             return;
@@ -101,6 +117,11 @@ fn relation_row(
             ui.label(format!("{}: {}{}", col.name, ty, null));
         }
     });
+    if browse_clicked {
+        Some(rel.id)
+    } else {
+        None
+    }
 }
 pub fn filter_relations<'a>(model: &'a SchemaModel, filter: &str) -> Vec<&'a str> {
     let lower = filter.to_ascii_lowercase();

@@ -689,6 +689,69 @@ pub fn spawn_runtime(
                         }
                     });
                 }
+                AppCommand::CommitEdit {
+                    sql,
+                    params,
+                    connection,
+                    refresh_sql: _,
+                } => {
+                    // Parameterized UPDATE from the table-browser edit flow
+                    // (§20): prepare + positional bind, never interpolation.
+                    // No history insert — params may carry user data (§35).
+                    let Some(sess) = sessions.get(&connection) else {
+                        let _ = event_tx.try_send(AppEvent::Error {
+                            op: "edit".into(),
+                            message: "not connected".into(),
+                        });
+                        continue;
+                    };
+                    let client = std::sync::Arc::clone(&sess.client);
+                    let ev_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let stmt = match client.prepare(&sql).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "edit".into(),
+                                    message: pgnative_results::stream::pg_error_text(&e),
+                                });
+                                return;
+                            }
+                        };
+                        let refs: Vec<&str> = params.iter().map(String::as_str).collect();
+                        let bound: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                            refs.iter().map(|s| s as _).collect();
+                        match client.query(&stmt, &bound).await {
+                            Ok(rows) => {
+                                if rows.is_empty() {
+                                    // Optimistic guard matched nothing:
+                                    // someone else changed the row first (§21).
+                                    send_reliable(
+                                        &ev_tx,
+                                        AppEvent::EditConflict {
+                                            message: "row changed since it was read — re-browse and retry".into(),
+                                        },
+                                    )
+                                    .await;
+                                } else {
+                                    send_reliable(
+                                        &ev_tx,
+                                        AppEvent::EditCommitted {
+                                            rows: rows.len() as u64,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.try_send(AppEvent::Error {
+                                    op: "edit".into(),
+                                    message: pgnative_results::stream::pg_error_text(&e),
+                                });
+                            }
+                        }
+                    });
+                }
             }
         }
         // Ensure bridge thread exits on shutdown

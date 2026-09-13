@@ -67,6 +67,16 @@ pub enum AppCommand {
         query_id: QueryId,
         format: ExportFormat,
     },
+    /// Parameterized row update from the table-browser edit flow (§20).
+    /// `params` are bound positionally (`$1..$N`) — never interpolated.
+    /// `refresh_sql` is the browse query to re-run after a successful commit
+    /// so the grid reflects `RETURNING *` without custom row conversion.
+    CommitEdit {
+        sql: String,
+        params: Vec<String>,
+        connection: ConnectionId,
+        refresh_sql: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +125,12 @@ pub enum AppEvent {
     },
     HistoryResults {
         results: Vec<String>,
+    },
+    EditCommitted {
+        rows: u64,
+    },
+    EditConflict {
+        message: String,
     },
 }
 
@@ -465,6 +481,27 @@ pub fn delete_password(id: ConnectionId) -> Result<(), pgnative_storage::keychai
 // eframe integration — PgnativeApp (§30: render is pure, no SQL/FS blocking)
 // ---------------------------------------------------------------------------
 
+/// Table-browser context (§17): the grid shows rows of one browsable
+/// relation via a purpose-built `SELECT … ORDER BY pk LIMIT` query.
+/// Only while this is `Some` may the grid offer inline editing — arbitrary
+/// query results never get edit affordances (no identity inference).
+#[derive(Debug, Clone)]
+pub struct BrowseContext {
+    pub schema_name: String,
+    pub relation: pgnative_schema::model::relation::Relation,
+    pub sql: String,
+}
+
+/// An optimistic UPDATE awaiting explicit user confirmation (§20).
+#[derive(Debug, Clone)]
+pub struct PendingConfirm {
+    pub row_global: u64,
+    pub diffs: Vec<pgnative_results::edit::ColumnDiff>,
+    pub sql: String,
+    pub params: Vec<String>,
+    pub refresh_sql: String,
+}
+
 /// Top-level eframe app wiring explorer/editor/results/layout/theme/history.
 ///
 /// All heavy work (DB, storage, keychain) happens via `AppCommand` dispatch
@@ -506,6 +543,14 @@ pub struct PgnativeApp {
     pub export_status: Option<String>,
     /// Shared result store (populated by async execution layer).
     pub store: Arc<parking_lot::RwLock<pgnative_results::store::ResultStore>>,
+    /// Active table-browser target (§17). Set by Explorer "Browse", cleared
+    /// by any arbitrary Execute (Run/Ctrl+Enter/history) so edits never
+    /// apply to guessed identities.
+    pub browse_context: Option<BrowseContext>,
+    /// In-progress cell edits keyed by (stable row index, store column).
+    pub pending_edits: HashMap<(u64, usize), String>,
+    /// Optimistic UPDATE awaiting explicit confirmation (§20 diff preview).
+    pub edit_confirm: Option<PendingConfirm>,
     completion_cache: Option<Arc<pgnative_schema::completion::CompletionEngine>>,
     completion_schema_ptr: Option<*const pgnative_schema::model::SchemaModel>,
     runtime_handle: Option<tokio::task::JoinHandle<()>>,
@@ -591,6 +636,9 @@ impl PgnativeApp {
             last_completed_query: None,
             export_status: None,
             store,
+            browse_context: None,
+            pending_edits: HashMap::new(),
+            edit_confirm: None,
             completion_cache: None,
             completion_schema_ptr: None,
             runtime_handle,
@@ -641,7 +689,12 @@ impl PgnativeApp {
                         // panel — warn-only leaves stale rows on screen.
                         // ("query" is the runtime's op for failed Execute;
                         // "execute" covers the not-connected guard.)
-                        if op == "execute" || op == "query" || op == "commit" || op == "rollback" {
+                        if op == "execute"
+                            || op == "query"
+                            || op == "commit"
+                            || op == "rollback"
+                            || op == "edit"
+                        {
                             self.query_error = Some(message.clone());
                         }
                         tracing::warn!(op = %op, message = %message, "app error");
@@ -662,6 +715,10 @@ impl PgnativeApp {
                     // and any previous error banner.
                     self.last_completed_query = None;
                     self.query_error = None;
+                    // Row indexes restart per stream — stale cell drafts would
+                    // overlay the wrong rows.
+                    self.pending_edits.clear();
+                    self.edit_confirm = None;
                 }
                 AppEvent::QueryFinished {
                     query_id, success, ..
@@ -677,6 +734,32 @@ impl PgnativeApp {
                 AppEvent::ExportProgress { written, path, .. } => {
                     self.export_status = Some(format!("exported {written} rows → {path}"));
                 }
+                AppEvent::EditCommitted { rows } => {
+                    self.query_error = None;
+                    self.pending_edits.clear();
+                    self.edit_confirm = None;
+                    // Refresh the browse grid so it reflects RETURNING *
+                    // without custom row conversion.
+                    if let (Some(browse), Some(conn_id)) =
+                        (self.browse_context.clone(), self.active_connection)
+                    {
+                        let tab = self
+                            .active_tab
+                            .clone()
+                            .unwrap_or_else(|| "browse".to_string());
+                        self.controller.send_command(AppCommand::Execute {
+                            tab,
+                            sql: browse.sql,
+                            connection: conn_id,
+                        });
+                    }
+                    tracing::info!(rows, "edit committed");
+                }
+                AppEvent::EditConflict { message } => {
+                    self.edit_confirm = None;
+                    self.query_error = Some(message.clone());
+                    tracing::warn!(message = %message, "edit conflict");
+                }
                 _ => {}
             }
         }
@@ -691,6 +774,11 @@ impl PgnativeApp {
             if let Some(tab_id) = self.active_tab.clone() {
                 if let Some(tab) = self.editor_tabs.get(&tab_id) {
                     if let Some(conn_id) = self.active_connection {
+                        // Arbitrary SQL owns the grid now — drop browse context
+                        // so the read-only grid cannot offer row edits (§17).
+                        self.browse_context = None;
+                        self.pending_edits.clear();
+                        self.edit_confirm = None;
                         self.controller.send_command(AppCommand::Execute {
                             tab: tab.id.clone(),
                             sql: tab.content.clone(),
@@ -843,17 +931,62 @@ impl eframe::App for PgnativeApp {
             });
         });
 
-        // Left: explorer — reads Arc<SchemaModel> snapshot, filterable
+        // Left: explorer — reads Arc<SchemaModel> snapshot, filterable.
+        // "Browse" on a relation runs a purpose-built keyset browse query
+        // (§17) and arms the editable grid; arbitrary SQL never does.
         let schema_clone = self.schema.clone();
-        egui::Panel::left("explorer")
+        let picked = egui::Panel::left("explorer")
             .resizable(true)
             .default_size(260.0)
             .show(ui, |ui| {
                 ui.label(self.theme.section_label("Explorer"));
                 ui.text_edit_singleline(&mut self.ui_state.search);
                 let model_ref = schema_clone.as_deref();
-                crate::ui::explorer::show_explorer(ui, model_ref, &self.ui_state.search);
-            });
+                crate::ui::explorer::show_explorer(ui, model_ref, &self.ui_state.search)
+            })
+            .inner;
+        if let Some(rel_id) = picked {
+            if let (Some(model), Some(conn_id)) = (schema_clone.as_deref(), self.active_connection)
+            {
+                if let Some(rel) = model.relation(rel_id) {
+                    let schema_name = model
+                        .schemas()
+                        .iter()
+                        .find(|s| s.id == rel.schema)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "public".to_string());
+                    match pgnative_results::table_browser::build_sql_with_schema(
+                        rel,
+                        Some(&schema_name),
+                        200,
+                        None,
+                    ) {
+                        Ok((sql, _)) => {
+                            self.pending_edits.clear();
+                            self.edit_confirm = None;
+                            self.browse_context = Some(BrowseContext {
+                                schema_name,
+                                relation: rel.clone(),
+                                sql: sql.clone(),
+                            });
+                            let tab = self
+                                .active_tab
+                                .clone()
+                                .unwrap_or_else(|| "browse".to_string());
+                            self.controller.send_command(AppCommand::Execute {
+                                tab,
+                                sql,
+                                connection: conn_id,
+                            });
+                        }
+                        Err(e) => {
+                            self.browse_context = None;
+                            self.query_error = Some(format!("cannot browse: {e}"));
+                        }
+                    }
+                }
+            }
+        }
 
         // Right: history panel (FTS) — driven by HistorySearch command.
         // Clicking an entry loads it into the editor and re-runs it when connected.
@@ -890,6 +1023,10 @@ impl eframe::App for PgnativeApp {
                 tab.content = sql.clone();
             }
             if let Some(conn_id) = self.active_connection {
+                // History replay is arbitrary SQL — never a browse (§17).
+                self.browse_context = None;
+                self.pending_edits.clear();
+                self.edit_confirm = None;
                 self.controller.send_command(AppCommand::Execute {
                     tab: tab_id,
                     sql,
@@ -1119,6 +1256,10 @@ impl eframe::App for PgnativeApp {
                             .clicked()
                         {
                             if let Some(conn_id) = self.active_connection {
+                                // Arbitrary SQL owns the grid now (§17).
+                                self.browse_context = None;
+                                self.pending_edits.clear();
+                                self.edit_confirm = None;
                                 self.controller.send_command(AppCommand::Execute {
                                     tab: tab.id.clone(),
                                     sql: tab.content.clone(),
@@ -1156,13 +1297,144 @@ impl eframe::App for PgnativeApp {
                 .ceil()
                 .max(1.0) as usize;
             self.viewport.len = visible + 2 * self.viewport.overscan;
+            // Edit gate: per-connection tx state — Active blocks edits (§22).
+            let tx_idle = match self.active_connection {
+                Some(conn_id) => {
+                    let st = self.controller.state.read();
+                    let tracked = st.tx.get(&conn_id).copied().unwrap_or(TxState::Idle);
+                    let live = st.connections.get(&conn_id).and_then(|cs| cs.tx_state());
+                    drop(st);
+                    !tracked.is_active() && !live.is_some_and(|t| t.is_active())
+                }
+                None => false,
+            };
             let store_guard = self.store.read();
             // Columns + rows under one read lock so header and body agree.
             let columns = store_guard.columns();
             let snap = self.viewport.snapshot(&store_guard);
             drop(store_guard);
-            // Show via ui/results helper (ScrollArea::show_rows internally)
-            crate::ui::results::show_results(ui, &mut self.viewport, &snap, &columns, &self.theme);
+            // Browse grid (editable, PK-gated) vs arbitrary SQL (read-only).
+            // Identity is never inferred from arbitrary results (§17).
+            let browse = self.browse_context.clone();
+            if let Some(browse_ctx) = browse {
+                let rel = &browse_ctx.relation;
+                let pk_names: Option<std::collections::HashSet<String>> =
+                    rel.primary_key.as_ref().map(|pk| {
+                        pk.columns
+                            .iter()
+                            .filter_map(|cid| rel.column_by_id(*cid))
+                            .map(|c| c.name.clone())
+                            .collect()
+                    });
+                if pk_names.is_none() {
+                    ui.label(
+                        egui::RichText::new("Read-only browse — no primary key")
+                            .weak()
+                            .small(),
+                    );
+                }
+                let editable: Vec<bool> = columns
+                    .iter()
+                    .map(|name| {
+                        let not_pk = pk_names
+                            .as_ref()
+                            .is_some_and(|set| !set.contains(name));
+                        not_pk
+                            && rel.column_named(name).is_some_and(|c| {
+                                c.value_source
+                                    == pgnative_schema::model::types::ValueSource::Stored
+                            })
+                    })
+                    .collect();
+                let save_req = crate::ui::results::show_editable_results(
+                    ui,
+                    &mut self.viewport,
+                    crate::ui::results::EditableGrid {
+                        snapshot: &snap,
+                        columns: &columns,
+                        editable: &editable,
+                        tx_idle,
+                        pending: &mut self.pending_edits,
+                    },
+                    &self.theme,
+                );
+                if let Some(req) = save_req {
+                    if !tx_idle {
+                        self.query_error = Some(
+                            "edit disabled: explicit transaction active — commit or rollback before editing".to_string(),
+                        );
+                    } else if let Some(row) = snap.rows.get(req.snap_pos) {
+                        let edit_map: HashMap<usize, String> =
+                            req.edits.into_iter().collect();
+                        let original: Vec<(String, String)> = columns
+                            .iter()
+                            .zip(row.cells.iter())
+                            .map(|(n, c)| (n.clone(), c.to_display_string()))
+                            .collect();
+                        let edited: Vec<(String, String)> = columns
+                            .iter()
+                            .zip(row.cells.iter())
+                            .enumerate()
+                            .map(|(i, (n, c))| {
+                                (
+                                    n.clone(),
+                                    edit_map
+                                        .get(&i)
+                                        .cloned()
+                                        .unwrap_or_else(|| c.to_display_string()),
+                                )
+                            })
+                            .collect();
+                        let pk_values: Vec<(String, String)> = pk_names
+                            .as_ref()
+                            .map(|set| {
+                                set.iter()
+                                    .filter_map(|name| {
+                                        columns.iter().position(|c| c == name).and_then(|idx| {
+                                            row.cells.get(idx).map(|cell| {
+                                                (name.clone(), cell.to_display_string())
+                                            })
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        match pgnative_results::edit::diff_columns(rel, &original, &edited) {
+                            Ok(diffs) => {
+                                match pgnative_results::edit::update_sql_optimistic(
+                                    rel, &diffs, &pk_values,
+                                ) {
+                                    Ok((sql, params)) => {
+                                        self.edit_confirm = Some(PendingConfirm {
+                                            row_global: req.row_global,
+                                            diffs,
+                                            sql,
+                                            params,
+                                            refresh_sql: browse_ctx.sql.clone(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        self.query_error =
+                                            Some(format!("cannot build update: {e}"));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.query_error = Some(format!("no update: {e}"));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Show via ui/results helper (ScrollArea::show_rows internally)
+                crate::ui::results::show_results(
+                    ui,
+                    &mut self.viewport,
+                    &snap,
+                    &columns,
+                    &self.theme,
+                );
+            }
             self.theme.band().show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!("{} rows · {:?}", snap.total, snap.state))
@@ -1193,6 +1465,47 @@ impl eframe::App for PgnativeApp {
                 }
             });
         });
+
+        // Edit confirmation dialog (§20): explicit diff preview — the UPDATE
+        // runs only after the user confirms the exact changed columns.
+        if let Some(pending) = self.edit_confirm.clone() {
+            egui::Window::new("Confirm update")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} column(s) changed", pending.diffs.len()))
+                            .strong(),
+                    );
+                    for d in &pending.diffs {
+                        ui.label(format!("{}: {} → {}", d.col, d.old, d.new));
+                    }
+                    ui.separator();
+                    ui.monospace(&pending.sql);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(self.theme.primary_button("Confirm update"))
+                            .clicked()
+                        {
+                            if let Some(conn_id) = self.active_connection {
+                                self.pending_edits
+                                    .retain(|(g, _), _| *g != pending.row_global);
+                                self.edit_confirm = None;
+                                self.controller.send_command(AppCommand::CommitEdit {
+                                    sql: pending.sql.clone(),
+                                    params: pending.params.clone(),
+                                    connection: conn_id,
+                                    refresh_sql: pending.refresh_sql.clone(),
+                                });
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.edit_confirm = None;
+                        }
+                    });
+                });
+        }
 
         // Disconnect decision dialog (§22): an open txn blocks teardown until
         // the user commits, rolls back, or keeps the connection open.
